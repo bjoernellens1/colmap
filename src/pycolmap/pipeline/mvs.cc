@@ -9,7 +9,6 @@
 #if defined(COLMAP_CUDA_ENABLED) || defined(COLMAP_HIP_ENABLED)
 #include "colmap/mvs/patch_match.h"
 #endif  // COLMAP_CUDA_ENABLED || COLMAP_HIP_ENABLED
-
 #include "colmap/util/logging.h"
 
 #include "pycolmap/helpers.h"

@@ -393,8 +393,7 @@ void DenseReconstructionWidget::Stereo() {
   }
 
 #if defined(COLMAP_MVS_ENABLED) && \
-    (defined(COLMAP_CUDA_ENABLED) || defined(COLMAP_HIP_ENABLED))
-  auto processor =
+    (defined(COLMAP_CUDA_ENABLED) || defined(COLMAP_HIP_ENABLED))  auto processor =
       std::make_unique<ControllerThread<mvs::PatchMatchController>>(
           std::make_shared<mvs::PatchMatchController>(
               *options_->patch_match_stereo, workspace_path, "COLMAP", ""));
