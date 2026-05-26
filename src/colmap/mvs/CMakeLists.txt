@@ -303,4 +303,11 @@ if(HIP_ENABLED)
     # <hip/hip_runtime.h>. Make hip::host visible to consumers of colmap_mvs
     # (e.g. patch_match.cc) so the include path resolves.
     target_link_libraries(colmap_mvs PUBLIC hip::host)
+
+    COLMAP_ADD_TEST(
+        NAME gpu_mat_test
+        SRCS gpu_mat_test.cu
+        LINK_LIBS colmap_mvs_cuda
+    )
+    set_source_files_properties(gpu_mat_test.cu PROPERTIES LANGUAGE HIP)
 endif()
