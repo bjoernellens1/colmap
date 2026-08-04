@@ -250,7 +250,7 @@ if(CUDA_ENABLED)
                     foreach(_cap IN LISTS _GPU_COMPUTE_CAPS)
                         string(STRIP "${_cap}" _cap)
                         string(REGEX MATCH
-                               "^([0-9]+)\.([0-9]+)" _match "${_cap}")
+                               "^([0-9]+)\\.([0-9]+)" _match "${_cap}")
                         if(_match)
                             math(EXPR _sm
                                  "${CMAKE_MATCH_1} * 10 + ${CMAKE_MATCH_2}")

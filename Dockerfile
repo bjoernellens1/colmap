@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1.7
 FROM rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0
 
+ARG ROCM_ARCH=gfx1151
+
 ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
-    ROCM_ARCH=gfx1151 \
-    HSA_OVERRIDE_GFX_VERSION=11.5.1
+    PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y \
     cmake \
@@ -36,6 +36,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 ARG CMAKE_EXTRA_ARGS=""
+ARG KEEP_SOURCE=0
 
 COPY . /opt/colmap_src
 RUN mkdir -p /opt/colmap_src/build \
@@ -48,7 +49,7 @@ RUN mkdir -p /opt/colmap_src/build \
         ${CMAKE_EXTRA_ARGS} \
     && ninja -j "$(nproc)" \
     && ninja install \
-    && if [ -z "${CMAKE_EXTRA_ARGS}" ]; then rm -rf /opt/colmap_src; fi
+    && if [ "${KEEP_SOURCE}" = "0" ]; then rm -rf /opt/colmap_src; fi
 
 WORKDIR /workspace
 ENTRYPOINT ["colmap"]

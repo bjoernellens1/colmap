@@ -1,5 +1,30 @@
 # ROCm/HIP integration log
 
+## Current status (read this first)
+
+As of 2026-08-04, on this branch (`hip-integration`):
+
+- **HIP-accelerated:** dense stereo (`patch_match_stereo`) only — verified building
+  and running correctly on real data on gfx1151 (Task 7).
+- **CPU-only (not HIP):** feature extraction/matching (SIFT — HIP SIFT deferred,
+  see "Task 5" below) and bundle adjustment (Caspar-HIP deferred, see "Task 6"
+  below — COLMAP vendors Caspar as CUDA-only generated source, unrelated to the
+  standalone `symforce-rocm` fork's HIP Caspar work).
+- Earlier entries below (particularly around Task 4 and the Task 5 fallback note)
+  describe an intermediate state where Caspar-HIP was still assumed available —
+  that assumption was invalidated by Task 6. Where an entry conflicts with this
+  status block, this status block is current; the entry is a historical record of
+  what was believed true at the time, not a live claim.
+- Post-final-review fixes (2026-08-04): `ROCM_ARCH` is now a Dockerfile `ARG`
+  (overridable via `--build-arg`), `HSA_OVERRIDE_GFX_VERSION` was removed from
+  the image's persistent `ENV` (every documented run command already passes it
+  via `-e` explicitly, so this wasn't load-bearing — an image should not force a
+  GPU-arch override on whoever runs it), and the tests-enabled build now needs
+  `KEEP_SOURCE=1` explicitly (previously any non-empty `CMAKE_EXTRA_ARGS` kept
+  the source tree as a side effect) — Task 4's `docker build ... --build-arg
+  CMAKE_EXTRA_ARGS="-DTESTS_ENABLED=ON"` invocation above needs
+  `--build-arg KEEP_SOURCE=1` added if repeated after this fix.
+
 ## Task 3: Rebase COLMAP PR #4420 onto current `upstream/main` (2026-08-04)
 
 **Source:** `ishengnan/rocm-support` (PR [#4420](https://github.com/colmap/colmap/pull/4420),
