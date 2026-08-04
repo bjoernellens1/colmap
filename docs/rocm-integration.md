@@ -2,17 +2,24 @@
 
 ## Current status (read this first)
 
-As of 2026-08-04, on this branch (`hip-integration`):
+As of 2026-08-05, on this branch (`hip-integration`):
 
-- **HIP-accelerated:** dense stereo (`patch_match_stereo`) only — verified building
-  and running correctly on real data on gfx1151 (Task 7).
-- **CPU-only (not HIP):** feature extraction/matching (SIFT — HIP SIFT deferred,
-  see "Task 5" below) and bundle adjustment (Caspar-HIP deferred, see "Task 6"
-  below — COLMAP vendors Caspar as CUDA-only generated source, unrelated to the
-  standalone `symforce-rocm` fork's HIP Caspar work).
-- Earlier entries below (particularly around Task 4 and the Task 5 fallback note)
-  describe an intermediate state where Caspar-HIP was still assumed available —
-  that assumption was invalidated by Task 6. Where an entry conflicts with this
+- **HIP-accelerated:** dense stereo (`patch_match_stereo`) AND bundle adjustment
+  (`CASPAR` backend, native OpenCV camera-model support included from the start)
+  — both verified building and running correctly on real data on gfx1151. Caspar-HIP
+  BA closes the deferral noted below: it turned out to require build-system fixes
+  (three real, iterated-on bugs, see the Caspar-HIP Completion entries below), not
+  a fundamentally missing capability.
+- **CPU-only (not HIP):** feature extraction/matching only (SIFT — HIP SIFT attempt
+  documented below, cherry-pick abandoned; CPU/OpenGL SIFT remains the working path).
+- Earlier entries below (particularly around Task 4 and the old Task 5/6 deferral
+  notes) describe an intermediate state where Caspar-HIP was believed structurally
+  blocked ("COLMAP vendors Caspar as CUDA-only generated source"). That assumption
+  no longer holds: `symforce-rocm`'s own codegen templates (as of its
+  `hip-integration` branch) now bake in full HIP support for every generated
+  Caspar kernel unconditionally, and colmap-rocm's build system only needed a
+  handful of CMake wiring fixes on top, not the from-scratch device-code-mapping
+  effort originally assumed necessary. Where an entry below conflicts with this
   status block, this status block is current; the entry is a historical record of
   what was believed true at the time, not a live claim.
 - Post-final-review fixes (2026-08-04): `ROCM_ARCH` is now a Dockerfile `ARG`
@@ -494,3 +501,203 @@ symbolic debugger such as `rocgdb` attached to the abort, not simply a
 `docs/superpowers/plans/track-c-task1-report.md` on the `colmap-sift-cherrypick`
 branch (the refactor `e95eb380`'s own commit message flagged as
 "left for a separate change").
+
+## Caspar-HIP Completion, Track B (2026-08-05): wiring Caspar-HIP into COLMAP with native OpenCV support
+
+Executed against `docs/superpowers/plans/2026-08-04-caspar-hip-completion.md`,
+Track B Tasks 1, 2, 4, 5 (Task 3 was cut from the critical path in that plan).
+Closes the "bundle adjustment CPU-only" deferral above for real — Caspar-HIP BA
+now builds and runs correctly on gfx1151, with native `OPENCV` camera-model
+support merged in from the start (not a follow-up), per an explicit design
+decision made before this work started.
+
+### Task 1: Port caspar-opencv's C++ dispatch changes
+
+Ported `rosbag-colmap-pipeline`'s `docker/patches/caspar-opencv/{bundle_adjustment_caspar.cc,caspar_model_adapter.h}`
+(read-only reference, targets COLMAP 4.1.1) into this branch's current tree.
+Diffed first, as required — did not blind-apply.
+
+- `bundle_adjustment_caspar.cc`: this branch's tip had already drifted from the
+  reference (switched `std::unordered_map`/`unordered_set` to `NodeHashMap`/
+  `FlatHashMap`/`FlatHashSet`, added `VLOG_IS_ON(2)` gating for `print_progress`)
+  — unrelated to the OpenCV patch. Ported only the two `BuildSizing()` `kOpenCV`
+  blocks (pose count, calib count) on top of that drift, mirroring the existing
+  `kPinhole` blocks.
+- `caspar_model_adapter.h`: otherwise byte-identical to the reference minus the
+  OpenCV additions (no drift) — applied the reference file wholesale:
+  `CasparSolverSizing` OpenCV fields, `OpenCVAdapter` class, `CreateCasparAdapter()`
+  case, and `CreateSolver()`'s full positional-argument list (the single
+  highest-risk part of the original patch — silently wrong-compiling if
+  misordered).
+- Pre-regeneration sanity check: current `generated/f32/solver.h`'s
+  `GraphSolver` constructor (no OpenCV nodes yet) matched the non-OpenCV
+  portion of the ported call exactly, by name and position.
+- Commit: `feat(caspar): port OpenCV camera-model dispatch from rosbag-colmap-pipeline's caspar-opencv patch`.
+
+### Task 2: Regenerate Caspar kernels with OpenCV support
+
+Ported `caspar_generate.py`'s `opencv_core`/`opencv_split_core` additions the
+same way (clean diff, pure additions, no drift). Cross-checked the distortion
+formula against this branch's own `src/colmap/sensor/models.h`
+`OpenCVCameraModel::Distortion`/`ImgFromCam` — exact match (params order
+`[fx,fy,cx,cy,k1,k2,p1,p2]`, `radial = k1*r2 + k2*r2^2`, same `du`/`dv` terms),
+unchanged from the 4.1.1 baseline the reference patch targeted.
+
+Regenerated `generated/f32/` (host Python lacked a working `symengine` build
+compatible with `symforce-rocm`'s vendored fork — ran codegen inside the
+`rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0` container
+instead, with `symforce-rocm` `pip install -e .`'d there). Exit 0, no 48KB
+shared-memory-budget error. 713 files, 224 new OpenCV-related.
+
+**Notable finding, not anticipated by the plan:** every regenerated file now
+unconditionally `#include`s `"cuda_to_hip.h"`, and the regenerated
+`CMakeLists.txt` gained a full `USE_HIP` option (`find_package(hip)`,
+`LANGUAGE HIP` source properties, `HIP_ARCHITECTURES`). This isn't something
+this session added — `symforce-rocm`'s own upstream jinja templates
+(`symforce/caspar/source/templates/*.jinja`) now bake in HIP support
+unconditionally, including shipping a full, already-authored Caspar-specific
+`cuda_to_hip.h` compat header (`symforce/caspar/source/runtime/cuda_to_hip.h`,
+authored by Jeff Daily, AMD) that maps `cudaMalloc`→`hipMalloc` etc., and
+provides `caspar_hip::reduce_sum`/`labeled_reduce_sum`/`match_any_mask` HIP
+fallbacks for the `cg::reduce`/`cg::labeled_partition` operations HIP's
+cooperative_groups lacks. This substantially changed Task 4's scope from
+"write a compat header from scratch" to "fix real build-system wiring bugs
+around an already-correct header" (see Task 4 below).
+
+PINHOLE/SIMPLE_RADIAL kernel logic itself is unchanged versus the prior
+committed tree — the diff there is clang-format-style reformatting plus the
+`cuda_to_hip.h`/`USE_HIP` additions only, not a logic regression.
+
+Re-verified Task 1's `CreateSolver()` positional-argument port against the
+now-OpenCV-augmented `solver.h`'s actual `GraphSolver` constructor: node-type
+order (`OpenCVCalib`, `OpenCVFocalAndExtra`, `OpenCVPose`,
+`OpenCVPrincipalPoint`, `Pinhole*`, `Point`, `SimpleRadial*`) and factor-count
+order (`simple_radial` → `pinhole` → `opencv` → `*_split` variants) match
+exactly, zero mismatches.
+
+`f64` left unregenerated: `CASPAR_USE_DOUBLE` defaults `OFF` in this branch's
+`CMakeLists.txt` and is untested elsewhere in the branch.
+
+Commit: `feat(caspar): regenerate kernels with native OPENCV camera-model support`.
+
+### Task 4: Add HIP compilation to CASPAR_ENABLED
+
+Extended `cmake/FindDependencies.cmake`'s `CASPAR_ENABLED` arch guard with a
+standalone `if(HIP_ENABLED AND CASPAR_ENABLED)` block (requires
+`CMAKE_HIP_ARCHITECTURES` set, warns — doesn't fail — on any arch other than
+`gfx1151`, the only one built and run to date). Mirrored the existing CUDA
+`FetchContent` block in `src/thirdparty/CMakeLists.txt` with a
+`CASPAR_ENABLED AND HIP_ENABLED` branch that sets `USE_HIP ON` before
+`FetchContent_MakeAvailable`, which the regenerated `CMakeLists.txt` (Task 2)
+picks up to build itself as a HIP project.
+
+Per the plan's explicit instruction ("Build and iterate on real compile
+errors — do not suppress. If a construct is genuinely unmappable, stop and
+report BLOCKED"), this took **three build iterations**, each a real bug found
+and fixed, none suppressed:
+
+1. `fatal error: hip/hip_runtime.h: No such file or directory` — the
+   regenerated `CMakeLists.txt`'s own
+   `target_include_directories(caspar_lib_core PUBLIC ${hip_INCLUDE_DIRS})`
+   is a no-op: modern `find_package(hip)` never sets that legacy variable,
+   only populates `hip::host`'s own `INTERFACE_INCLUDE_DIRECTORIES`. Fixed by
+   reading that target property (with a `ROCM_PATH`-based fallback if empty)
+   in the generated `CMakeLists.txt`.
+2. Same error persisted after fix #1 — root cause was actually
+   `src/thirdparty/CMakeLists.txt`'s pre-existing
+   `set_target_properties(caspar_lib_core PROPERTIES INTERFACE_INCLUDE_DIRECTORIES ...)`
+   call, which **overwrites** rather than appends, silently wiping out
+   whatever the generated `CMakeLists.txt` had just set (including fix #1).
+   Fixed by re-adding the ROCm include dir afterwards with
+   `target_include_directories()` (which appends) instead. Also had to add
+   `target_compile_definitions(caspar_lib_core PUBLIC __HIP_PLATFORM_AMD__)`:
+   HIP-language translation units get this defined implicitly by the compiler
+   wrapper, but plain C++ consumers (colmap's `bundle_adjustment.cc`,
+   transitively via `solver.h`) do not, and `hip_runtime.h` `#error`s out
+   without it.
+3. `'__device__' does not name a type` — `cuda_to_hip.h` unconditionally
+   defines `__device__ __forceinline__` function bodies
+   (`caspar_hip::reduce_sum`/`reduce_max`/`match_any_mask`/`labeled_reduce_sum`)
+   whenever `USE_HIP` is defined, but `USE_HIP` being defined does not mean
+   the translation unit is being compiled by `hipcc`/`clang++ --hip` — plain
+   `g++` cannot parse `__device__` at all, regardless of what headers it's
+   given. Since `USE_HIP` is now (correctly, per fix #2) propagated `PUBLIC`
+   to every consumer of `caspar_lib_core`, including plain-C++
+   `bundle_adjustment.cc`, this broke. Fixed by guarding the `hipcub`/
+   `hip_cooperative_groups.h` includes and all four `__device__` function
+   definitions (plus the macros referencing them) behind `__HIPCC__`, which
+   the HIP compiler defines automatically and a plain host compiler never
+   does — these are device-only utilities never called from host code, so
+   losing them in host translation units is correct, not a functionality
+   regression. This is a hand-patch on top of `symforce-rocm`'s vendored
+   `cuda_to_hip.h` (shipped verbatim by Task 2's regeneration); consistent
+   with the plan's "Caspar-specific cooperative_groups HIP compat header"
+   step, which turned out to already exist upstream rather than needing to
+   be written from scratch, but still needed this host/device-compile-mode
+   fix specific to how colmap-rocm's build reaches this header from plain
+   C++ translation units.
+
+Verified: `docker build -t colmap-rocm:caspar-hip --build-arg CMAKE_EXTRA_ARGS="-DCASPAR_ENABLED=ON" .`
+(Dockerfile already bakes in `-DCUDA_ENABLED=OFF -DHIP_ENABLED=ON
+-DCMAKE_HIP_ARCHITECTURES=gfx1151`) completes clean, 0 `FAILED` targets,
+image tagged `localhost/colmap-rocm:caspar-hip`.
+
+Commit: `feat(caspar): add HIP compilation path to CASPAR_ENABLED (gfx1151)`.
+
+### Task 5: Verify Caspar-HIP bundle adjustment on real data, gfx1151
+
+`colmap mapper --help` confirms `--Mapper.ba_global_backend`/
+`--Mapper.ba_local_backend` accept `CASPAR` (registered via
+`option_manager.cc`'s `#ifdef CASPAR_ENABLED` block — not printed as an
+explicit choices list in `--help` output, confirmed by reading the source
+rather than guessing from `--help` text alone).
+
+**Dataset:** same 31-frame subsample (every 15th frame of 451) from
+`~/git/rosbag-colmap-pipeline/data/workspaces/table1/rgb/` used by the prior
+milestone's Task 7 end-to-end run, staged fresh at `/tmp/caspar-hip-e2e/`.
+
+**Pipeline:** `feature_extractor --FeatureExtraction.use_gpu 0` (31/31 images,
+0.028 min) → `sequential_matcher --FeatureMatching.use_gpu 0` (31/31 matched,
+0.116 min) → `mapper` run twice from the same database, once per backend:
+
+```bash
+docker run --rm --device=/dev/kfd --device=/dev/dri --group-add 39 --group-add 105 \
+  --security-opt label=disable -e HSA_OVERRIDE_GFX_VERSION=11.5.1 -e QT_QPA_PLATFORM=offscreen \
+  -v /tmp/caspar-hip-e2e:/workspace/data localhost/colmap-rocm:caspar-hip \
+  mapper --database_path /workspace/data/db.sqlite --image_path /workspace/data/images \
+  --output_path /workspace/data/sparse_caspar \
+  --Mapper.ba_global_backend CASPAR --Mapper.ba_local_backend CASPAR
+```
+
+vs the same command with `--output_path /workspace/data/sparse_ceres` and no
+backend flags (default Ceres/CPU).
+
+**Results (`colmap model_analyzer`, both models):**
+
+| | Caspar-HIP (gfx1151) | Ceres (CPU, default) |
+|---|---|---|
+| Registered images | 17 / 31 | 17 / 31 |
+| 3D points | 1342 | 1342 |
+| Observations | 5167 | 5170 |
+| Mean track length | 3.850 | 3.852 |
+| Mean reprojection error | 0.630 px | 0.543 px |
+
+Caspar-HIP mapper run: 1.169 min (13 registration steps, "Keeping successful
+reconstruction", no errors/crashes in the log — grepped for
+`error|caspar|hip|failed|crash|abort`, zero matches). Ceres run: 0.047 min
+(expected — no GPU dispatch overhead at this tiny problem size).
+
+**Verdict: PASS.** Identical registered-image count, identical point count,
+reprojection error same order of magnitude (both sub-pixel, ~15% apart — well
+within the "not required to match bit-for-bit" tolerance the plan set). No
+crashes, no NaNs, no divergent/degenerate reconstruction. This is real,
+on-hardware confirmation that Caspar-HIP's bundle adjustment — including the
+newly-added native OpenCV camera-model path wired in Tasks 1–2 (this
+dataset's cameras are `SIMPLE_RADIAL`, not `OPENCV`, so the OpenCV dispatch
+path itself was verified for build/link correctness and positional-argument
+safety in Tasks 1–2's cross-checks rather than exercised numerically here —
+none of the staged images' cameras use `OPENCV`; a follow-up with an
+`OPENCV`-model dataset would close that last numerical gap) — produces
+correct results on gfx1151, not just a clean compile.
+
+Commit: `docs: verify Caspar-HIP bundle adjustment on real data, gfx1151 — closes prior Task 6 deferral`.
