@@ -44,8 +44,38 @@ if(USE_HIP)
   # Link hip targets PRIVATE to avoid propagating HIP compile options to pure-CXX consumers.
   # The static library has the HIP code linked in; pybind consumers only need the includes.
   target_link_libraries(caspar_lib_core PRIVATE hip::host hip::hipcub)
-  # Expose ROCm include directory for consumers that need hipError_t etc
-  target_include_directories(caspar_lib_core PUBLIC ${hip_INCLUDE_DIRS})
+  # Expose ROCm include directory for consumers that need hipError_t etc.
+  # NOTE: ${hip_INCLUDE_DIRS} is not actually set by modern find_package(hip)
+  # (which only populates the hip::host imported target's own
+  # INTERFACE_INCLUDE_DIRECTORIES, not a legacy <Package>_INCLUDE_DIRS
+  # variable), so that expression silently expanded to nothing and left pure
+  # C++ consumers of caspar_lib_core (e.g. colmap's bundle_adjustment.cc,
+  # which only transitively needs solver.h -- not any HIP kernel -- but
+  # solver.h unconditionally #includes cuda_to_hip.h, which under -DUSE_HIP
+  # requires <hip/hip_runtime.h>) building with -DUSE_HIP but no HIP include
+  # path: "fatal error: hip/hip_runtime.h: No such file or directory".
+  # Pull the real include dirs from the hip::host target instead -- but
+  # hip::host's own INTERFACE_INCLUDE_DIRECTORIES can ALSO be empty (the
+  # HIP-language compiler wrapper knows its own ROCm sysroot implicitly, so
+  # find_package(hip) doesn't always need to publish an explicit -I for
+  # HIP-language translation units; plain CXX translation units get no such
+  # implicit knowledge). Fall back to ROCM_PATH (set by
+  # cmake/FindDependencies.cmake's HIP_ENABLED block, visible here as a
+  # CACHE variable) if the target property comes back empty.
+  get_target_property(_caspar_hip_host_includes hip::host
+                       INTERFACE_INCLUDE_DIRECTORIES)
+  if(_caspar_hip_host_includes)
+    target_include_directories(caspar_lib_core PUBLIC ${_caspar_hip_host_includes})
+  elseif(DEFINED ROCM_PATH AND EXISTS "${ROCM_PATH}/include/hip/hip_runtime.h")
+    target_include_directories(caspar_lib_core PUBLIC "${ROCM_PATH}/include")
+  else()
+    message(WARNING
+      "Caspar-HIP: could not determine ROCm include directory from "
+      "hip::host's INTERFACE_INCLUDE_DIRECTORIES or ROCM_PATH "
+      "('${ROCM_PATH}') -- pure-C++ consumers of caspar_lib_core "
+      "(e.g. colmap's bundle_adjustment.cc, via solver.h -> cuda_to_hip.h) "
+      "may fail to find <hip/hip_runtime.h>.")
+  endif()
   # Use -ffp-contract=fast -fno-math-errno instead of -ffast-math.
   # clang's -ffast-math enables -fassociative-math which can NaN backward passes.
   target_compile_options(caspar_lib_core PRIVATE

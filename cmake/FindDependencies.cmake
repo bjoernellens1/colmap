@@ -396,6 +396,37 @@ else()
     set(CUDA_ENABLED OFF)
 endif()
 
+if(HIP_ENABLED AND CASPAR_ENABLED)
+    # Caspar-HIP has only been built and verified against gfx1151 on this
+    # branch (this session's work -- see docs/rocm-integration.md). Other
+    # archs may well work (the HIP compat layer -- cuda_to_hip.h, shipped by
+    # symforce-rocm's own codegen templates as of this branch's regenerated
+    # Caspar tree -- is not gfx1151-specific by design), but they are
+    # untested; warn rather than silently accepting them, mirroring the
+    # CUDA branch's own native/all/all-major warning above.
+    if(NOT CMAKE_HIP_ARCHITECTURES)
+        message(FATAL_ERROR
+            "CASPAR_ENABLED with HIP_ENABLED requires CMAKE_HIP_ARCHITECTURES "
+            "to be set (e.g. -DCMAKE_HIP_ARCHITECTURES=gfx1151).")
+    endif()
+    set(_caspar_hip_tested_archs "gfx1151")
+    set(_caspar_hip_untested FALSE)
+    foreach(_caspar_hip_arch IN LISTS CMAKE_HIP_ARCHITECTURES)
+        if(NOT _caspar_hip_arch IN_LIST _caspar_hip_tested_archs)
+            set(_caspar_hip_untested TRUE)
+        endif()
+    endforeach()
+    if(_caspar_hip_untested)
+        message(WARNING
+            "CASPAR_ENABLED with HIP_ENABLED: CMAKE_HIP_ARCHITECTURES="
+            "'${CMAKE_HIP_ARCHITECTURES}' includes an architecture Caspar-HIP "
+            "has not been verified against (only gfx1151 has been built and "
+            "run to date). It may still work, but treat results on other "
+            "archs as unverified until checked.")
+    endif()
+    message(STATUS "Enabling Caspar-HIP support (archs: ${CMAKE_HIP_ARCHITECTURES})")
+endif()
+
 if(ONNX_ENABLED)
     if(FETCH_ONNX)
         include(FetchContent)

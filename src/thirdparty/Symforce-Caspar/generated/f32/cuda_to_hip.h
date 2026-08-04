@@ -14,8 +14,19 @@
 #if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
 
 #include <hip/hip_runtime.h>
+// hip_cooperative_groups.h and hipcub/hipcub.hpp declare __device__ code
+// (device-only intrinsics, templated kernels) that only a HIP-aware
+// compiler pass (__HIPCC__, defined automatically by hipcc/clang++ --hip)
+// can parse. Plain host C++ translation units (e.g. colmap's
+// bundle_adjustment.cc, which only needs this header transitively via
+// solver.h for host-visible declarations like hipError_t/cudaMalloc
+// macros -- it never calls into device code) get -DUSE_HIP too, via
+// caspar_lib_core's PUBLIC compile definitions, so this header must not
+// assume USE_HIP implies a HIP-language compile.
+#if defined(__HIPCC__)
 #include <hip/hip_cooperative_groups.h>
 #include <hipcub/hipcub.hpp>
+#endif
 
 // CUDA runtime API -> HIP runtime API
 #define cudaMalloc              hipMalloc
@@ -40,6 +51,8 @@
 // HIP shared-memory atomics are block-scoped by definition (no inter-block visibility),
 // so atomicAdd_block is equivalent to atomicAdd on shared memory.
 #define atomicAdd_block atomicAdd
+
+#if defined(__HIPCC__)
 
 // CUB -> hipCUB namespace
 namespace cub = hipcub;
@@ -117,6 +130,8 @@ __device__ __forceinline__ T labeled_reduce_sum(GroupT group, T val, LabelT labe
 #define CG_REDUCE_SUM(group, val) caspar_hip::reduce_sum(group, val)
 #define CG_LABELED_REDUCE_SUM(group, val, label, is_leader) \
     caspar_hip::labeled_reduce_sum(group, val, label, is_leader)
+
+#endif  // __HIPCC__
 
 #else  // CUDA path
 
