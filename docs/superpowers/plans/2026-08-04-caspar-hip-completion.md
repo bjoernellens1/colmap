@@ -196,34 +196,18 @@ git push origin hip-integration
 
 ---
 
-## Track B, Task 3: Build-verify the regenerated (still-CUDA) tree compiles
+## Track B, Task 3: (cut from critical path — folded into Track D as an optional extra check)
 
-**Files:** none new — build/run verification only.
-
-**Interfaces:**
-- Consumes: Track B Tasks 1-2's output.
-- Produces: confirmation the OpenCV-augmented `CASPAR_ENABLED=ON, CUDA_ENABLED=ON` configuration compiles cleanly, before adding HIP complexity on top. If this doesn't build, Task 4 (HIP wiring) has no known-good baseline to diff against when debugging.
-
-This step needs a CUDA-capable machine — this gfx1151 host cannot compile `CUDA_ENABLED=ON`. Coordinate with Track D (the cluster CUDA regression check) rather than duplicating cluster access setup — if Track D is already done or in progress, reuse its dispatch mechanism here instead of re-deriving it.
-
-- [ ] **Step 1: Dispatch a CUDA build via the cluster (same mechanism as Track D)**
-
-See Track D, Task 1 for the `ablator`/cluster dispatch pattern — use the same approach, pointed at `colmap-rocm`'s `hip-integration` branch with `-DCASPAR_ENABLED=ON -DCUDA_ENABLED=ON` (no `HIP_ENABLED` yet, this task is CUDA-only).
-
-- [ ] **Step 2: Verify `colmap bundle_adjuster --help` lists the OpenCV-aware Caspar path**
-
-Confirm no "unsupported camera model" warnings appear when running Caspar BA against a small OPENCV-model reconstruction (any existing sparse model with `camera_model: OPENCV` — check `rosbag-colmap-pipeline`'s workspaces for one, or produce a tiny one via `feature_extractor --ImageReader.camera_model OPENCV`).
-
-- [ ] **Step 3: Log and commit**
-
-```bash
-cd ~/git/colmap-rocm
-# append to docs/rocm-integration.md: cluster build command, pass/fail, any
-# OpenCV-BA smoke-test output
-git add docs/rocm-integration.md
-git commit -m "docs: verify OpenCV-augmented Caspar CUDA build on cps-gpu-cluster"
-git push origin hip-integration
-```
+**Amended before dispatch:** this task originally asked to CUDA-build-verify the
+OpenCV-augmented tree on the cluster before adding HIP on top, and pointed at
+Track D's dispatch mechanism — which created a circular "coordinate with each
+other" dependency (Track D's own step said to check whether Track B had landed
+first). Track B Task 4 (HIP wiring) does not actually need this CUDA baseline to
+proceed — it builds and debugs directly against `HIP_ENABLED=ON` on this gfx1151
+host. Cut: Track B now runs Task 1 → Task 2 → **Task 4** → Task 5. If Track D
+(independent, see below) happens to run and its dispatch mechanism turns out to
+be readily reusable, use it there to *additionally* verify the OpenCV-augmented
+CUDA build as a bonus check — but nothing in Track B blocks on it.
 
 ---
 
@@ -406,7 +390,9 @@ kubectl get nodes -l accelerator=nvidia
 kubectl get gitrepo -n fleet-local
 ```
 
-Per `cps-gpu-cluster`'s own `CLAUDE.md`: GPU workers are at `.38/.43/.40/.41`, labeled `accelerator=nvidia,gpu-model=a100`. Check `~/git/rosbag-colmap-pipeline/docs/cluster-dispatch.md` for the exact `ablator`-based dispatch pattern already proven for COLMAP CUDA builds on this cluster — reuse it rather than inventing a new dispatch mechanism. This likely means building a container image with `colmap-rocm`'s `hip-integration` branch source (not `rosbag-colmap-pipeline`'s own COLMAP checkout) and adapting `ablator`'s config to point at it.
+Per `cps-gpu-cluster`'s own `CLAUDE.md`: GPU workers are at `.38/.43/.40/.41`, labeled `accelerator=nvidia,gpu-model=a100`. Check `~/git/rosbag-colmap-pipeline/docs/cluster-dispatch.md` for the exact `ablator`-based dispatch pattern already proven for COLMAP CUDA builds on this cluster.
+
+**Resolve this before anything else in this task:** `ablator` (per `docs/cluster-dispatch.md`) dispatches a *prebuilt image tag* (`cuda-caspar-opencv-v2`) at a workspace — it does not itself build images. Find out where that image was actually built (`~/git/rosbag-colmap-pipeline/configs/ablator.toml`, `.github/workflows/`, or any build-related script/doc in that repo) before assuming `ablator`'s dispatch mechanism is reusable as-is for building *new* `colmap-rocm` source. If the build happens in CI or on a separate dev box with a CUDA toolchain, this task's real first step is "find or create a way to build a CUDA image from `colmap-rocm` source with access to a CUDA toolchain" — which may mean an in-cluster Kaniko/buildkit build (a different mechanism from `ablator`'s job-dispatch, since `cps-gpu-cluster`'s K3s pods run workloads, not necessarily privileged image builds) rather than local `docker build` (this gfx1151 host has no CUDA toolchain to build against natively either). If no readily-available CUDA build path exists within a reasonable scope: stop, document exactly what's missing, and report BLOCKED rather than inventing new cluster infrastructure — this is explicitly the lowest-value of the four sub-projects (it verifies a CMake merge conflict that only affects CUDA users of this fork, which is nobody today) and isn't worth a large infra detour.
 
 - [ ] **Step 2: Build with CUDA_ENABLED=ON on a GPU worker**
 
