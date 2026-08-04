@@ -162,3 +162,27 @@ covers PatchMatch stereo (Task 3/4) and Caspar (separate task) — this remains 
 partial-HIP end-to-end run, not a fully-CPU fallback. The plan's success criteria should be
 read as "HIP-accelerated PatchMatch + Caspar, CPU/OpenGL SIFT" rather than full-HIP-frontend,
 per this task's brief.
+
+## 2026-08-04 — Task 4 follow-up: gpu_mat_test retest with GPU idle
+
+Per the task review's required follow-up: re-ran `ctest -R 'mvs|gpu_mat|patch_match'`
+in the already-built `colmap-rocm:hip-tests` image once no `splatograph_train_tmp*`
+container was running.
+
+```bash
+docker run --rm --name gpu_mat_retest \
+  --device=/dev/kfd --device=/dev/dri \
+  --group-add 39 --group-add 105 \
+  --security-opt label=disable \
+  -e HSA_OVERRIDE_GFX_VERSION=11.5.1 \
+  --entrypoint bash \
+  localhost/colmap-rocm:hip-tests \
+  -c "cd /opt/colmap_src/build && ctest -R 'mvs|gpu_mat|patch_match' --output-on-failure"
+```
+
+Result: **14/14 tests passed**, including `mvs/gpu_mat_test` (previously failed with
+a HIP "Memory in use" error under GPU contention). Confirms the Task 4 report's
+hypothesis: the original failure was resource contention from a concurrent,
+unrelated training workload on this shared single-GPU host, not a defect in
+PR #4420's HIP PatchMatch/GpuMat port. PatchMatch-HIP is now verified clean at the
+unit-test level; Task 7 proceeds with confidence in this layer.
