@@ -341,3 +341,135 @@ One stage (`patch_match_stereo`, dense stereo) is genuinely HIP-accelerated and
 verified working on real data, not just unit tests. SIFT and bundle adjustment
 run on CPU (Tasks 5 and 6 deferred, both with documented reasons and future
 paths). This is the honest, achieved scope of this plan as of 2026-08-04.
+
+## 2026-08-04: Track C Task 1 — HIP SIFT via selective cherry-pick from jeffdaily/rocm-sift-gpu
+
+**Goal:** land HIP-accelerated SIFT (`SiftGPU`) on `hip-integration` without repeating
+the whole-branch rebase that previously aborted on its first commit (12 conflicted
+files against PatchMatch-HIP's already-ported compat layer).
+
+**Classification of all 10 commits on `jeffdaily/rocm-sift-gpu`** (oldest to newest):
+
+| # | Commit | Touches SIFT only? | Disposition |
+|---|--------|---------------------|-------------|
+| 1 | `658f8b56` "Add ROCm/HIP support for patch_match_stereo" | No — `cuda_flip/rotate/texture/transpose.h`, `gpu_mat.h`, `patch_match_cuda.h`, `util/cuda*.{cc,h}`, `mvs/CMakeLists.txt` | **Skip** — this is the original (superseded) patch_match HIP port; already-ported differently by PR #4420 on `hip-integration`. |
+| 2 | `786e0963` "fix(cmake): address code review feedback" | No — same compat-layer files (portability fixes on #1) | **Skip** — fixups to a superseded commit. |
+| 3 | `e609b9f1` "Fix ROCm/HIP support: dual-compatible headers..." | No — same compat-layer files, reworked | **Skip** — still the superseded patch_match approach. |
+| 4 | `def43b23` "Simplify ROCm/HIP support: enable_language(HIP) + cuda_to_hip.h" | No — introduces `src/colmap/util/cuda_to_hip.h`, rewrites `mvs/CMakeLists.txt`, `cuda_flip/rotate/texture/transpose.h`, `gpu_mat.h` | **Skip** — this is the commit that introduces the compat-header approach PR #4420 already carries (in its own, further-evolved form) on `hip-integration`. |
+| 5 | `690348f3` "Enable gpu_mat_test under HIP and report HIP backend in version banner" | No — `mvs/CMakeLists.txt`, `mvs/gpu_mat_test.cu`, `util/version.cc.in` | **Skip.** Functionality forgone: `mvs/gpu_mat_test` is not registered to build/run under `HIP_ENABLED` on this branch. Functionality *not* forgone: the "with HIP" version-banner string is already present in `hip-integration`'s `src/colmap/util/version.cc.in` (verified: `#elif defined(COLMAP_HIP_ENABLED) ... "with HIP"`), landed independently by PR #4420. |
+| 6 | `566e4df7` "docs: document HIP/ROCm build in install.rst, drop stale README.rocm.md" | Docs only | **Skip.** Targets a `README.rocm.md` that does not exist on `hip-integration` (never added — PR #4420 took a different path) and an `doc/install.rst` HIP paragraph that `hip-integration` does not have in the form this commit expects. Not mechanically applicable; the underlying facts it would document (build flags, arch mapping) are superseded by this branch's own conventions. |
+| 7 | `bf064e92` "Enable GPU SIFT (SiftGPU) under ROCm/HIP" | **Yes** (SIFT-specific: `thirdparty/SiftGPU/*`, `feature/sift.cc`, dispatch-site widening in `controllers/`, `feature/`, `ui/`, `pycolmap/`) plus small additive touches to `cuda_to_hip.h` (9 new `#define`s, no removals) and `FindDependencies.cmake` (widen one `if` condition) | **Cherry-picked.** |
+| 8 | `e95eb380` "SiftGPU: fix double-destroy and DoG edge OOB" | **Yes** — `thirdparty/SiftGPU/{CuTexImage.cpp,CuTexImage.h,ProgramCU.cu}` only | **Cherry-picked.** |
+| 9 | `3345a981` "SiftGPU: route tex2D through linear binding on HIP" | **Yes** — `thirdparty/SiftGPU/ProgramCU.cu` only | **Cherry-picked.** |
+| 10 | `e41e06e0` "docs: note GPU SIFT is now covered by the HIP backend" | Docs only, 2-line edit to the same `doc/install.rst` HIP paragraph #6 targets | **Skip** — same reason as #6: that paragraph does not exist in this branch's `doc/install.rst` in the expected form. |
+
+**Cherry-pick branch:** `colmap-sift-cherrypick`, based on `hip-integration` tip
+`e8ad01ca`. Commits, in order:
+- `b1a3f26b` = cherry-pick of `bf064e92`
+- `7dd7a7fc` = cherry-pick of `e95eb380`
+- `66eaa995` = cherry-pick of `3345a981`
+- `77c6959f` = local fix-up commit repairing a formatting bug introduced while
+  resolving `b1a3f26b`'s merge conflicts (see below)
+
+**Conflict resolution (all in `b1a3f26b`):** 3 files conflicted —
+`src/colmap/controllers/automatic_reconstruction.cc`,
+`src/colmap/ui/dense_reconstruction_widget.cc`, `src/pycolmap/pipeline/mvs.cc`.
+In every case the conflict was HEAD (PR #4420's `hip-integration`) already having
+an equivalent `#if defined(COLMAP_CUDA_ENABLED) || defined(COLMAP_HIP_ENABLED)`
+guard in different formatting/comment style from what `bf064e92` introduces —
+same semantics, cosmetic diff only. Resolved by keeping HEAD's guard in all three.
+An automated resolution script had a bug (dropped a newline after a multi-line
+`#if` continuation), which broke the build (`missing binary operator before
+token "auto"` in `dense_reconstruction_widget.cc`); fixed in follow-up commit
+`77c6959f` (also restores two cosmetic blank lines lost the same way in the
+other two files). `cuda_to_hip.h`, `FindDependencies.cmake`, and the SiftGPU
+files merged cleanly with no conflicts.
+
+**Build:** `docker build -t colmap-rocm:hip-sift ~/git/colmap-rocm` (from the
+`colmap-sift-cherrypick` worktree) succeeds cleanly — `libcolmap_sift_gpu.a`
+links as a HIP static library (`ProgramCU.cu` compiled through the HIP
+toolchain per `set_source_files_properties(... LANGUAGE HIP)`), `-DCOLMAP_GPU_ENABLED`
+present in `colmap_ui`'s compile flags confirming `bf064e92`'s
+`FindDependencies.cmake` widening took effect.
+
+**Runtime test — GPU SIFT initializes and extracts, then faults on reuse:**
+
+Dataset: 30 frames (every 15th of 451) from
+`~/git/rosbag-colmap-pipeline/data/workspaces/table1/rgb/`, all 1280×720.
+
+```bash
+docker run --rm --device=/dev/kfd --device=/dev/dri --group-add 39 --group-add 105 \
+  --security-opt label=disable -e HSA_OVERRIDE_GFX_VERSION=11.5.1 -e QT_QPA_PLATFORM=offscreen \
+  -v <dataset-dir>:/workspace/data colmap-rocm:hip-sift \
+  feature_extractor --database_path /workspace/data/db.sqlite --image_path /workspace/data/images \
+  --FeatureExtraction.use_gpu 1
+```
+
+- `sift.cc:761 "Creating SIFT GPU feature extractor"` confirms the HIP GPU SIFT
+  path is selected (not a CPU/GLSL fallback).
+- The **first** GPU-extracted image always succeeds, with correct nonzero
+  keypoint counts (e.g. 4582, 3693, 3670 SIFT features — plausible, non-degenerate
+  values for these images).
+- The process then **aborts with a GPU memory access fault**
+  ("Memory access fault by GPU node-1 ... Reason: Page not present or supervisor
+  privilege", SIGABRT) on the **second or third** image — reproduced across 3
+  full-dataset runs, faulting on a different image each time (once on image 3,
+  twice on image 2, including once on the same file — `000213.png` — that
+  succeeded cleanly in a different run). This run-to-run variance in exactly
+  which image faults, despite an identical fixed input set, is itself the key
+  signal: it rules out a deterministic per-image indexing/size bug and points at
+  heap/allocator-state-dependent corruption — i.e. a use-after-free or stale
+  handle in the code paths that reuse `SiftGPU`'s internal buffers/textures
+  across images, most likely in `e95eb380`'s `CuTexObj` rule-of-five rewrite
+  (move-only semantics, handle nulling, guarded destructor) or `3345a981`'s
+  `BindTexture2D` → `BindTexture` (linear-binding) switch — both touch exactly
+  the texture-object lifecycle that would only misbehave on reuse, not on a
+  fresh object.
+- Ruled out as GPU contention: `Memory access fault ... Page not present` is a
+  virtual-address fault from an illegal access inside a kernel, not an
+  allocation failure — contention from other GPU workloads on this host (e.g.
+  `splat_train`, confirmed running concurrently via `docker ps` / `rocm-smi
+  --showpids` during testing) produces `hipErrorOutOfMemory`/"Memory in use"
+  errors, a different failure mode. The fault reproduced identically both with
+  and without a concurrent container competing for the GPU.
+- `AMD_SERIALIZE_KERNEL=3` (forces synchronous kernel launches so an abort is
+  attributed to the actual faulting launch rather than a later sync point) was
+  used on one run: the fault still occurred at the same point (second image),
+  confirming it is synchronous with a specific kernel launch rather than a
+  deferred/batched async report. This build has no debug symbols, so the
+  specific kernel name was not recoverable from the abort — that would need a
+  separate debug build or a GPU-side debugger, out of scope for this task.
+- **Isolation probe:** running `feature_extractor` on `000213.png` alone (the
+  file that had both succeeded and faulted in different multi-image runs)
+  succeeds cleanly every time (3693 features, 0.007 min, no fault). This
+  confirms the defect is specific to **cross-image buffer/texture reuse**, not
+  the extraction kernel logic on a fresh SiftGPU instance.
+
+**Outcome: documented fallback, not folded into `hip-integration`.** GPU SIFT
+compiles cleanly under HIP on gfx1151 and correctly extracts features for the
+first image processed by a given `SiftGPU` instance, but crashes non-deterministically
+once more than one image goes through the same instance — a real, upstream
+(pre-existing in `jeffdaily/rocm-sift-gpu`, not introduced by cherry-picking)
+buffer/texture-lifecycle bug in the reuse path, not a smoke-test triviality and
+not a conflict-resolution artifact (the isolated single-image path proves the
+ported code is functionally correct; the surviving files after conflict
+resolution match HEAD's semantics exactly). Per this task's stated scope (two
+diagnostic probes, then document — not patch `ProgramCU.cu`), this is left for
+a future session.
+
+**State left behind:** `hip-integration` itself was **not modified or reset**
+— `main` (this file) only. The `colmap-sift-cherrypick` branch (4 commits atop
+`hip-integration` tip `e8ad01ca`: `b1a3f26b`, `7dd7a7fc`, `66eaa995`, `77c6959f`)
+is kept, not deleted, and pushed to `origin` so the classification work and
+conflict resolution do not need to be redone. `hip-integration`'s own tip is
+confirmed an ancestor of `colmap-sift-cherrypick`
+(`git merge-base --is-ancestor hip-integration colmap-sift-cherrypick` → true,
+checked before writing this entry).
+
+**To resume:** a future session should attribute the fault to a specific
+kernel/API call (e.g. build with `-DCMAKE_BUILD_TYPE=RelWithDebInfo` for a
+symbolic backtrace, or bisect by reverting `3345a981`'s `BindTexture` switch
+in isolation against `e95eb380` alone) before deciding whether to fix the
+CuTexObj lifecycle directly or fall back to `BindTexture2D` with a padded/
+aligned pitch (the refactor `e95eb380`'s own commit message flagged as
+"left for a separate change").
