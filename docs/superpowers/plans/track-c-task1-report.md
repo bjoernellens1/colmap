@@ -59,20 +59,28 @@ Full reasoning, conflict-resolution detail, and the runtime diagnosis are in
     log line), not CPU/GLSL fallback.
   - First image always succeeds with correct nonzero keypoint counts.
   - Crashes with a GPU memory access fault (`Page not present or supervisor
-    privilege`, SIGABRT) on the 2nd or 3rd image, reproduced across 3 runs,
-    with the specific failing image varying run to run (including one file
-    that succeeded in one run and faulted in another).
+    privilege`, SIGABRT) **deterministically on the 2nd image processed by a
+    given `SiftGPU` instance**, always after the 1st succeeds — confirmed by
+    two independent clean runs (one plain, one with `AMD_SERIALIZE_KERNEL=3`)
+    both faulting at exactly the same position on exactly the same image
+    (`000213.png` as the 2nd GPU-processed image). A third run showed the
+    same pattern once its own contamination (an already-populated database
+    causing the 1st file to be skipped) is accounted for — its "3rd file"
+    was still its "2nd GPU-processed image." Not run-to-run nondeterminism;
+    a consistent "works once per instance, fails on reuse" signature.
   - Ruled out GPU contention from other containers on this host (`splat_train`
     etc.) — this fault type (illegal in-kernel access) differs from the
     `hipErrorOutOfMemory`/"Memory in use" signature contention would produce,
     and reproduced identically with and without a concurrent container.
   - `AMD_SERIALIZE_KERNEL=3` probe: fault still occurs at the same point,
-    confirming it's synchronous with a specific kernel launch (no debug
-    symbols in this build to name the kernel — would need a
-    `RelWithDebInfo` rebuild for that, out of scope here).
-  - Isolation probe: running `feature_extractor` on the single faulting image
-    alone succeeds cleanly every time — proves the defect is in cross-image
-    buffer/texture **reuse**, not the per-image extraction kernels themselves.
+    confirming it's synchronous with a specific kernel launch rather than a
+    deferred async report. `AMD_SERIALIZE_KERNEL` does not itself print
+    kernel names, so the specific faulting call was not identified — that
+    would need a symbolic debugger (e.g. `rocgdb`) attached to the abort.
+  - Isolation probe: running `feature_extractor` on the faulting image alone
+    (i.e. as the 1st and only image) succeeds cleanly every time — proves the
+    defect is in cross-image buffer/texture **reuse**, not the per-image
+    extraction kernels themselves.
 
 ## Why this is a documented fallback, not folded in
 
@@ -94,18 +102,24 @@ documented rather than attempting a fix.
 - `hip-integration`: unchanged except for one docs-only commit
   (`57b26614`, `docs/rocm-integration.md`). **Not reset, not force-pushed.**
 - `colmap-sift-cherrypick`: kept (not deleted), pushed to `origin`. Contains
-  the 3 cherry-picked SIFT commits plus 1 local fix-up commit, ready for a
-  future session to resume debugging without redoing the classification or
-  conflict resolution.
-- Safety check performed before any of this: confirmed
-  `hip-integration`'s tip is an ancestor of `colmap-sift-cherrypick`
-  (`git merge-base --is-ancestor hip-integration colmap-sift-cherrypick` → true)
-  — moot in the end since no reset was performed, but done proactively per
-  the plan's stated safety protocol.
+  the 3 cherry-picked SIFT commits, 1 local fix-up commit, and this report
+  (`1682d716`), ready for a future session to resume debugging without
+  redoing the classification or conflict resolution.
+- Safety check performed before pushing the docs commit to `hip-integration`:
+  confirmed `hip-integration`'s tip (`e8ad01ca` at the time) was an ancestor
+  of `colmap-sift-cherrypick`. **This is now stale**: `hip-integration`
+  subsequently advanced to `57b26614` (the docs commit itself), which is
+  *not* on `colmap-sift-cherrypick`. A future session must re-verify
+  ancestry (or `git rebase hip-integration colmap-sift-cherrypick` first)
+  before any `git reset --hard` fold-in — doing so blind would silently
+  drop this docs entry.
 
 ## Recommended next step (for a future session)
 
-Rebuild with `-DCMAKE_BUILD_TYPE=RelWithDebInfo` to get a symbolic backtrace
-naming the actual faulting kernel/API call, or bisect by testing `e95eb380`
-alone (without `3345a981`) against a 2+ image run to narrow which of the two
-commits' changes causes the reuse fault.
+Bisect within the 3 cherry-picked commits: build with only `bf064e92` +
+`e95eb380` (i.e. drop `3345a981`'s `BindTexture2D` → `BindTexture` switch)
+and re-run the same 2-image test. If it still faults, the bug is in
+`e95eb380`'s `CuTexObj` rule-of-five rewrite; if it's clean, `3345a981`'s
+linear-binding switch is the cause. For kernel-level attribution of the
+fault itself, attach a symbolic debugger (`rocgdb`) to the abort — a
+`RelWithDebInfo` rebuild alone will not surface the kernel name.
