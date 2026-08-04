@@ -383,7 +383,39 @@ git push origin hip-integration
 
 ---
 
-## Task 6: Wire Caspar-HIP into the Docker build and mapper
+## Task 6: Wire Caspar-HIP into the Docker build and mapper — DEFERRED
+
+**Amended 2026-08-04, after Step 1 was actually run.** This task's premise —
+that SymForce ships a linkable HIP Caspar library COLMAP consumes via Docker
+multi-stage `COPY --from` — is wrong. Verified by direct inspection:
+- COLMAP vendors Caspar as **generated CUDA `.cu` source**,
+  `src/thirdparty/Symforce-Caspar/generated/{f32,f64}/` (241 kernel files in
+  `f32/` alone), compiled directly into the `colmap` binary — not linked as an
+  external library.
+- `CASPAR_ENABLED` (the flag Step 1 below correctly predicted) is wired **only
+  inside `if(CUDA_ENABLED AND CUDA_FOUND)`** in `cmake/FindDependencies.cmake`
+  — there is no HIP branch for it on `hip-integration` (PR #4420 only HIP-ported
+  PatchMatch/MVS, not Caspar).
+- The 241 vendored kernel files use `cooperative_groups`/`cg::reduce`/
+  `cg::labeled_partition` — CUDA-specific constructs `cuda_to_hip.h` (PR #4420's
+  compat header) has zero coverage of.
+
+Full writeup: `docs/rocm-integration.md`, "Task 6: Caspar-HIP wiring — DEFERRED"
+entry. Steps 2–4 below (the Docker multi-stage plan) are **not executed** — left
+in place only as a record of the original, invalidated approach. Two real paths
+for a future session are documented there: (1) add a HIP branch to
+`CASPAR_ENABLED` plus a Caspar-specific `cooperative_groups` compat header, or
+(2) regenerate `generated/{f32,f64}` from `caspar_generate.py` with
+`use_hip=True`. Neither is in scope here.
+
+**Consequence for Task 7:** the end-to-end run uses COLMAP's default Ceres CPU
+bundle adjustment, not Caspar. Task 7 below is amended accordingly — it no
+longer passes Caspar backend flags to `mapper`.
+
+<details>
+<summary>Original task text (not executed — kept for the record)</summary>
+
+### Task 6 (original): Wire Caspar-HIP into the Docker build and mapper
 
 **Files:**
 - Modify: `Dockerfile` (add SymForce build stage).
@@ -446,16 +478,27 @@ git commit -m "build: add standalone Dockerfile for HIP Caspar artifact export"
 git push origin hip-integration
 ```
 
+</details>
+
 ---
 
 ## Task 7: Full end-to-end incremental SfM run on gfx1151
+
+**Amended 2026-08-04:** with Task 6 deferred, this run uses PatchMatch-HIP
+(dense stereo, verified) + stock CPU/OpenGL SIFT (Task 5's documented fallback)
++ COLMAP's default Ceres CPU bundle adjustment (Caspar-HIP unavailable per
+Task 6's deferral). One HIP-accelerated stage (dense stereo), not three — this
+is the honest scope of "full incremental SfM end-to-end" on this branch today,
+not the original three-HIP-stage vision. Caspar-HIP itself remains
+independently verified as a standalone library (Task 2, in `symforce-rocm`) —
+it just isn't wired into this COLMAP binary yet.
 
 **Files:**
 - No source changes. This task only runs the pipeline and records results.
 - Modify: `docs/rocm-integration.md` (results log).
 
 **Interfaces:**
-- Consumes: `colmap-rocm:hip` image from Task 6 (PatchMatch-HIP + Caspar-HIP + SIFT-HIP-or-documented-fallback).
+- Consumes: `colmap-rocm:hip` image from Task 4 (PatchMatch-HIP verified 14/14 tests, gfx1151) + Task 5 (stock CPU/OpenGL SIFT, HIP SIFT deferred).
 - Produces: a recorded end-to-end run — this is the plan's success criterion, nothing downstream depends on its output artifacts.
 
 - [ ] **Step 1: Pick a real dataset and stage it**
@@ -490,7 +533,7 @@ docker run --rm \
     mkdir -p /workspace/data/sparse /workspace/data/dense &&
     colmap feature_extractor --database_path /workspace/data/db.sqlite --image_path /workspace/data/images &&
     colmap sequential_matcher --database_path /workspace/data/db.sqlite &&
-    colmap mapper --database_path /workspace/data/db.sqlite --image_path /workspace/data/images --output_path /workspace/data/sparse <Caspar backend flags from Task 6, Step 1> &&
+    colmap mapper --database_path /workspace/data/db.sqlite --image_path /workspace/data/images --output_path /workspace/data/sparse &&
     colmap image_undistorter --image_path /workspace/data/images --input_path /workspace/data/sparse/0 --output_path /workspace/data/dense &&
     colmap patch_match_stereo --workspace_path /workspace/data/dense
   "
