@@ -56,18 +56,11 @@ Read the full list of changed files. Note any files under codegen template direc
 
 ```bash
 cd ~/git/symforce-rocm
-git checkout hip-integration
-git rebase upstream/main jeffdaily/moat-port --onto hip-integration
-```
-
-If this exact form errors (wrong branch semantics), use the standard form instead:
-
-```bash
 git checkout -b symforce-hip-rebase jeffdaily/moat-port
 git rebase upstream/main
 ```
 
-Expected: PR #465's `mergeable_state` was `dirty` as of 2026-08-04, so expect conflicts. Resolve each conflict by keeping upstream's non-HIP-related changes and re-applying the HIP-specific hunks from the PR commit. Do not silently drop HIP code to resolve a conflict — if a conflict can't be resolved confidently, stop and consult advisor before guessing.
+Expected: PR #465's `mergeable_state` was `dirty` as of 2026-08-04, so expect conflicts. Resolve each conflict by keeping upstream's non-HIP-related changes and re-applying the HIP-specific hunks from the PR commit. Do not silently drop HIP code to resolve a conflict. If a conflict can't be resolved confidently: stop, write the full conflicting hunks, the file(s) involved, and exactly why you're unsure to `docs/rocm-integration.md` under a `## BLOCKED` heading, commit that file on a throwaway branch or just leave it uncommitted, and end the task here — do not guess and do not proceed to Step 3. This is a real stop condition, not a formality.
 
 - [ ] **Step 3: Fold the rebased commits onto `hip-integration`**
 
@@ -144,7 +137,7 @@ Adjust the inline Python to the actual API surface found in Step 1 — do not gu
 
 - [ ] **Step 3: Verify the output**
 
-Confirm the build produces a `.so`/`.hsaco`-backed library without errors, and that a trivial Python import/dlopen of it succeeds inside the container. If it fails, capture the full error and consult advisor before attempting fixes — this is exactly the kind of "results that don't fit" situation the advisor exists for.
+Confirm the build produces a `.so`/`.hsaco`-backed library without errors, and that a trivial Python import/dlopen of it succeeds inside the container. If it fails: stop, write the full error and command that produced it to `docs/rocm-integration.md` under `## BLOCKED`, and end the task here rather than attempting speculative fixes.
 
 - [ ] **Step 4: Log the outcome**
 
@@ -259,6 +252,8 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
+ARG CMAKE_EXTRA_ARGS=""
+
 COPY . /opt/colmap_src
 RUN mkdir -p /opt/colmap_src/build \
     && cd /opt/colmap_src/build \
@@ -267,16 +262,16 @@ RUN mkdir -p /opt/colmap_src/build \
         -DCUDA_ENABLED=OFF \
         -DHIP_ENABLED=ON \
         -DCMAKE_HIP_ARCHITECTURES=${ROCM_ARCH} \
-        -DGUI_ENABLED=OFF \
+        ${CMAKE_EXTRA_ARGS} \
     && ninja -j "$(nproc)" \
     && ninja install \
-    && rm -rf /opt/colmap_src
+    && if [ -z "${CMAKE_EXTRA_ARGS}" ]; then rm -rf /opt/colmap_src; fi
 
 WORKDIR /workspace
 ENTRYPOINT ["colmap"]
 ```
 
-This intentionally mirrors `~/git/rosbag-colmap-pipeline/docker/Dockerfile`'s package list and build pattern (verified working on this same base image), swapping the pinned-tag `git clone` for local `COPY` source and `-DCUDA_ENABLED=OFF` for the HIP flags. `GUI_ENABLED=OFF` avoids pulling in the Qt/CGAL GUI path we don't need — if the build fails without GUI deps present, drop `-DGUI_ENABLED=OFF` rather than adding untested flags.
+This intentionally mirrors `~/git/rosbag-colmap-pipeline/docker/Dockerfile`'s package list and build pattern (verified working on this same base image) — including keeping the full Qt5/CGAL/GUI dependency list installed and GUI_ENABLED at its default (ON), matching that reference exactly rather than introducing an untested `-DGUI_ENABLED=OFF` configuration nobody has verified. Swaps the pinned-tag `git clone` for local `COPY` source and `-DCUDA_ENABLED=OFF` for the HIP flags. `CMAKE_EXTRA_ARGS` lets Task 4 Step 3 opt into `-DTESTS_ENABLED=ON` without duplicating the whole Dockerfile, and skips deleting the build tree so `ctest` has binaries to run when tests are enabled.
 
 - [ ] **Step 2: Build the image**
 
@@ -285,23 +280,22 @@ cd ~/git/colmap-rocm
 docker build -t colmap-rocm:hip .
 ```
 
-Expected: image builds successfully. If HIP-specific compile errors occur (e.g. from `patch_match_cuda.cu` being compiled as HIP), capture the exact error — do not paper over it with `-Wno-*` flags without understanding what's failing. Consult advisor if the error isn't a straightforward missing-include/missing-flag issue.
+Expected: image builds successfully. If HIP-specific compile errors occur (e.g. from `patch_match_cuda.cu` being compiled as HIP), capture the exact error — do not paper over it with `-Wno-*` flags without understanding what's failing. If the error isn't a straightforward missing-include/missing-flag issue: stop, log the full error to `docs/rocm-integration.md` under `## BLOCKED`, and end the task here.
 
-- [ ] **Step 3: Run PatchMatch stereo against a real dataset**
+- [ ] **Step 3: Run the PR's own GPU unit tests as the smoke test (not a full dense run yet)**
 
-Use whichever dataset is fastest to reach on this machine — the Herz-Jesu-P8 set referenced in the PR discussion (small, well-known reference), or any existing sparse reconstruction already on this machine with images available (check `~/git/rosbag-colmap-pipeline` or `~/git/splatograph*` example data first before downloading anything new).
+No dense workspace (completed sparse model + undistorted images) exists on this machine yet — `patch_match_stereo` requires one, and building one is Task 7's job, after SIFT (Task 5) and Caspar (Task 6) are also wired in, so the first *full* dense run happens once, end-to-end, in Task 7 rather than twice. For this task, verify PatchMatch-HIP compiles and runs correctly at the unit level instead:
 
 ```bash
-docker run --rm \
-  --device=/dev/kfd --device=/dev/dri \
-  --group-add video --group-add render \
-  -v <dataset-dir>:/workspace/data \
+cd ~/git/colmap-rocm
+docker build -t colmap-rocm:hip-tests --build-arg CMAKE_EXTRA_ARGS="-DTESTS_ENABLED=ON" .
+docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video --group-add render \
   -e HSA_OVERRIDE_GFX_VERSION=11.5.1 \
-  colmap-rocm:hip \
-  patch_match_stereo --workspace_path /workspace/data/dense
+  --entrypoint bash colmap-rocm:hip-tests -c \
+  "cd /opt/colmap_src/build && ctest -R 'mvs|gpu_mat|patch_match' --output-on-failure"
 ```
 
-Expected: completes without HIP runtime errors, produces depth/normal maps. Compare fused-point count and valid-depth coverage sanity (nonzero, not wildly different from a CPU/reference run if one exists) — exact numeric match isn't required, but a near-zero or crashed result is a real failure, not "close enough."
+This requires the Dockerfile to accept a `CMAKE_EXTRA_ARGS` build arg (add `ARG CMAKE_EXTRA_ARGS=""` and append `${CMAKE_EXTRA_ARGS}` to the `cmake` invocation in Step 1's Dockerfile, and stop deleting `/opt/colmap_src` when tests are enabled — add a conditional so `ctest` has binaries to run against). Expected: `gpu_mat_test` and any `patch_match`-related tests pass on gfx1151, confirming the HIP kernels execute correctly before Task 7 relies on them inside a full pipeline.
 
 - [ ] **Step 4: Commit the Dockerfile and log results**
 
@@ -341,7 +335,9 @@ git checkout -b colmap-sift-rebase jeffdaily/rocm-sift-gpu
 git rebase hip-integration
 ```
 
-This rebases SIFT's 10 commits onto our already-rebased PatchMatch work, so both land together. Resolve conflicts using the same rule as prior tasks: keep upstream/hip-integration's independent changes, re-apply the SIFT-HIP-specific hunks. Given 115 commits of drift, budget real time here — if a single commit's conflicts are extensive and you're not confident in the resolution, stop and consult advisor rather than guessing at 115-commits'-worth of accumulated API changes.
+This rebases SIFT's 10 commits onto our already-rebased PatchMatch work, so both land together. Resolve conflicts using the same rule as prior tasks: keep upstream/hip-integration's independent changes, re-apply the SIFT-HIP-specific hunks.
+
+**Hard abort trigger (check after each commit's conflicts are resolved, via `git status` / `git diff --stat` during the rebase):** if more than 3 of the 10 commits produce conflicts, OR any single commit's conflict touches more than ~5 files, stop immediately and take the fallback path in Step 3 below — do not push through on a case-by-case "am I confident" judgment call. Given 115 commits of drift, that threshold is what separates "normal rebase friction" from "the branch has diverged too far to trust a mechanical resolution."
 
 - [ ] **Step 3 (success path): Fold onto hip-integration and push**
 
@@ -462,22 +458,40 @@ git push origin hip-integration
 - Consumes: `colmap-rocm:hip` image from Task 6 (PatchMatch-HIP + Caspar-HIP + SIFT-HIP-or-documented-fallback).
 - Produces: a recorded end-to-end run — this is the plan's success criterion, nothing downstream depends on its output artifacts.
 
-- [ ] **Step 1: Pick a real dataset**
+- [ ] **Step 1: Pick a real dataset and stage it**
 
-Use an existing dataset already present on this machine if available (check `~/git/rosbag-colmap-pipeline`, `~/git/splatograph*`, or any prior COLMAP run's image set) rather than downloading a new one, unless nothing suitable exists — in which case Herz-Jesu-P8 (referenced throughout the PR discussions as the common reference set) is the fallback.
+No pre-existing sparse/dense COLMAP workspace exists on this machine as of this plan's
+writing (checked `~/git/rosbag-colmap-pipeline` and `~/git/splatograph*`). Use
+`~/git/rosbag-colmap-pipeline/data/workspaces/table1/rgb/` (451 numbered PNG frames,
+already on this machine) instead of downloading anything new. Take a manageable subset
+rather than all 451 — full incremental SfM over 451 frames is a poor smoke test (slow,
+harder to debug a failure in):
 
-- [ ] **Step 2: Run the full pipeline inside the container**
+```bash
+mkdir -p /tmp/colmap-rocm-e2e/images
+cd ~/git/rosbag-colmap-pipeline/data/workspaces/table1/rgb
+ls *.png | awk 'NR % 15 == 1' | xargs -I{} cp {} /tmp/colmap-rocm-e2e/images/
+ls /tmp/colmap-rocm-e2e/images | wc -l   # expect ~30 images
+```
+
+- [ ] **Step 2: Run the full pipeline inside the container, including dense stereo's prerequisites**
+
+`patch_match_stereo` needs a completed sparse model plus undistorted images, not just a
+folder of JPEGs/PNGs — run `image_undistorter` between `mapper` and
+`patch_match_stereo`:
 
 ```bash
 docker run --rm \
   --device=/dev/kfd --device=/dev/dri --group-add video --group-add render \
   -e HSA_OVERRIDE_GFX_VERSION=11.5.1 \
-  -v <dataset-dir>:/workspace/data \
+  -v /tmp/colmap-rocm-e2e:/workspace/data \
   colmap-rocm:hip \
   bash -c "
+    mkdir -p /workspace/data/sparse /workspace/data/dense &&
     colmap feature_extractor --database_path /workspace/data/db.sqlite --image_path /workspace/data/images &&
     colmap sequential_matcher --database_path /workspace/data/db.sqlite &&
     colmap mapper --database_path /workspace/data/db.sqlite --image_path /workspace/data/images --output_path /workspace/data/sparse <Caspar backend flags from Task 6, Step 1> &&
+    colmap image_undistorter --image_path /workspace/data/images --input_path /workspace/data/sparse/0 --output_path /workspace/data/dense &&
     colmap patch_match_stereo --workspace_path /workspace/data/dense
   "
 ```
@@ -507,10 +521,36 @@ git push origin hip-integration
 - **Fork/clone setup** (spec step 1) is already done as of this plan's writing — both repos exist at `~/git/colmap-rocm` and `~/git/symforce-rocm` with `hip-integration` branches pushed to `origin`, tracking `upstream/main`. No task needed for it.
 - **Placeholder scan:** no TBD/TODO left; the one deliberately open decision (Task 5's success-vs-fallback branch, Task 6's multi-context vs separate-build-stage choice) is resolved with a concrete recommended path, not left blank.
 - **Type/name consistency:** `hip-integration` branch name, `colmap-rocm:hip` / `symforce-hip:latest` image tags, and `HSA_OVERRIDE_GFX_VERSION=11.5.1` / `ROCM_ARCH=gfx1151` env vars are used identically across all tasks.
+- **Advisor-reachability fix:** dispatched subagents don't have the advisor tool. All "consult advisor" instructions were replaced with a concrete stop-and-log-to-`docs/rocm-integration.md`-under-`## BLOCKED` pattern; the coordinating session (not the subagent) checks that file between tasks and consults advisor itself if needed.
+- **Worktree-per-task was wrong:** git can't have one branch checked out in two worktrees, and `hip-integration` is reset+force-pushed at the end of nearly every task. Fixed to one worktree per repo (two tracks total), tasks within a track run sequentially — see Parallelization Notes.
+- **Dataset gap fixed:** confirmed no sparse/dense COLMAP workspace exists on this machine yet. Task 4's smoke test now uses the PR's own `ctest` suite (`-DTESTS_ENABLED=ON`) instead of a full dense run it had no data for; Task 7 now stages a real image subset (`rosbag-colmap-pipeline`'s `table1` frames) and runs the full `feature_extractor` → `matcher` → `mapper` → `image_undistorter` → `patch_match_stereo` chain, since dense stereo needs an undistorted sparse model as input, not a plain image folder.
+- **GUI_ENABLED contradiction fixed:** Dockerfile no longer passes `-DGUI_ENABLED=OFF` while installing the full Qt5/CGAL dep list — now matches `rosbag-colmap-pipeline`'s verified-working default (GUI deps installed, flag left at its default ON).
 
 ## Parallelization Notes (for subagent-driven-development)
 
-- **Track A** (Tasks 1–2, `symforce-rocm`) and **Track B** (Tasks 3–4, `colmap-rocm` minus SIFT) have no file overlap and can run concurrently in separate worktrees.
-- **Task 5** depends on Task 4 (rebases onto `hip-integration` after PatchMatch is already there) — do not start until Task 4's commit is pushed.
-- **Task 6** depends on both Task 2 (needs the verified Caspar build command) and Task 5 (needs the SIFT-or-fallback state of `hip-integration`) — do not start until both are pushed.
-- **Task 7** depends on Task 6 alone.
+**One worktree per repo, not per task.** Every task in a track ends by resetting and
+force-pushing the shared `hip-integration` branch; git only allows one worktree to have
+a given branch checked out at a time, and two worktrees resetting the same branch is a
+lost-update race. The real parallelism here is 2-way, not 7-way:
+
+- **Track A** = Tasks 1–2, runs entirely in one worktree, e.g. `~/git/wt/symforce-hip`
+  (or just `~/git/symforce-rocm` directly if no other work touches it concurrently).
+  Tasks 1 and 2 run sequentially within this worktree.
+- **Track B** = Tasks 3–4, runs entirely in one worktree, e.g. `~/git/wt/colmap-hip`.
+  Tasks 3 and 4 run sequentially within this worktree.
+- Track A and Track B have no file overlap (different repos) and dispatch concurrently.
+- **Task 5** depends on Track B's Task 4 (rebases onto `hip-integration` after
+  PatchMatch is already there) — do not start until Task 4's commit is pushed. Runs in
+  the same `colmap-hip` worktree as Track B (sequential continuation, not a new
+  worktree).
+- **Task 6** depends on both Task 2 (needs the verified Caspar build command, from
+  Track A) and Task 5 (needs the SIFT-or-fallback state of `hip-integration`) — do not
+  start until both are pushed. Touches both repos (adds a `Dockerfile` to
+  `symforce-rocm`, extends the one in `colmap-rocm`) — run it in the `colmap-hip`
+  worktree, reading `symforce-rocm`'s state directly rather than opening a third
+  worktree for a single-file addition.
+- **Task 7** depends on Task 6 alone. Same `colmap-hip` worktree.
+
+So: dispatch Track A and Track B concurrently (2 subagents). When Track B's Task 4
+completes, dispatch Task 5 as a follow-on in the same worktree. Once both Task 2 and
+Task 5 are done, dispatch Task 6, then Task 7 sequentially.
