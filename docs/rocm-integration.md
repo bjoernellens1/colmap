@@ -412,19 +412,23 @@ docker run --rm --device=/dev/kfd --device=/dev/dri --group-add 39 --group-add 1
   values for these images).
 - The process then **aborts with a GPU memory access fault**
   ("Memory access fault by GPU node-1 ... Reason: Page not present or supervisor
-  privilege", SIGABRT) on the **second or third** image — reproduced across 3
-  full-dataset runs, faulting on a different image each time (once on image 3,
-  twice on image 2, including once on the same file — `000213.png` — that
-  succeeded cleanly in a different run). This run-to-run variance in exactly
-  which image faults, despite an identical fixed input set, is itself the key
-  signal: it rules out a deterministic per-image indexing/size bug and points at
-  heap/allocator-state-dependent corruption — i.e. a use-after-free or stale
-  handle in the code paths that reuse `SiftGPU`'s internal buffers/textures
-  across images, most likely in `e95eb380`'s `CuTexObj` rule-of-five rewrite
-  (move-only semantics, handle nulling, guarded destructor) or `3345a981`'s
-  `BindTexture2D` → `BindTexture` (linear-binding) switch — both touch exactly
-  the texture-object lifecycle that would only misbehave on reuse, not on a
-  fresh object.
+  privilege", SIGABRT) on the image immediately after the first successfully
+  processed one. Lining up GPU-worked images (not raw file position) across
+  runs: one run had its first file (`000145.png`) skipped as already-extracted
+  (contaminated database from an earlier interrupted run sharing the same
+  output DB — discard this run, it is not a clean data point), so its first
+  *GPU* image was `000213.png` (succeeded) and its second was `000278.png`
+  (faulted, i.e. 3rd file overall). Two independent clean runs (one plain, one
+  with `AMD_SERIALIZE_KERNEL=3`) both started fresh and both faulted on
+  exactly the same position: 1st GPU image (`000145.png`) succeeds, 2nd GPU
+  image (`000213.png`) faults — identical outcome, not run-to-run variance.
+  This is a **deterministic "works once per instance, fails on reuse" pattern**,
+  which is textbook stale-handle/use-after-free behavior on a reused
+  buffer/texture, not a race or allocator-state coin-flip. It points at
+  `e95eb380`'s `CuTexObj` rule-of-five rewrite (move-only semantics, handle
+  nulling, guarded destructor) or `3345a981`'s `BindTexture2D` → `BindTexture`
+  (linear-binding) switch — both touch exactly the texture-object lifecycle
+  that would only misbehave on reuse, not on a fresh object.
 - Ruled out as GPU contention: `Memory access fault ... Page not present` is a
   virtual-address fault from an illegal access inside a kernel, not an
   allocation failure — contention from other GPU workloads on this host (e.g.
@@ -434,16 +438,18 @@ docker run --rm --device=/dev/kfd --device=/dev/dri --group-add 39 --group-add 1
   and without a concurrent container competing for the GPU.
 - `AMD_SERIALIZE_KERNEL=3` (forces synchronous kernel launches so an abort is
   attributed to the actual faulting launch rather than a later sync point) was
-  used on one run: the fault still occurred at the same point (second image),
+  used on one run: the fault still occurred at the same point (2nd GPU image),
   confirming it is synchronous with a specific kernel launch rather than a
-  deferred/batched async report. This build has no debug symbols, so the
-  specific kernel name was not recoverable from the abort — that would need a
-  separate debug build or a GPU-side debugger, out of scope for this task.
+  deferred/batched async report. `AMD_SERIALIZE_KERNEL` does not print kernel
+  names by itself, so the specific faulting kernel/API call was not identified
+  in this pass — that would need a symbolic tool (e.g. `rocgdb`) attached to
+  the abort, out of scope for this task's two-probe budget.
 - **Isolation probe:** running `feature_extractor` on `000213.png` alone (the
-  file that had both succeeded and faulted in different multi-image runs)
-  succeeds cleanly every time (3693 features, 0.007 min, no fault). This
-  confirms the defect is specific to **cross-image buffer/texture reuse**, not
-  the extraction kernel logic on a fresh SiftGPU instance.
+  image that faulted as the "2nd GPU image" in the two clean multi-image runs)
+  succeeds cleanly every time (3693 features, 0.007 min, no fault) when it is
+  the *only*, and therefore *first*, image processed. This confirms the defect
+  is specific to **cross-image buffer/texture reuse** — first use is always
+  clean — not the extraction kernel logic itself.
 
 **Outcome: documented fallback, not folded into `hip-integration`.** GPU SIFT
 compiles cleanly under HIP on gfx1151 and correctly extracts features for the
@@ -457,19 +463,34 @@ resolution match HEAD's semantics exactly). Per this task's stated scope (two
 diagnostic probes, then document — not patch `ProgramCU.cu`), this is left for
 a future session.
 
-**State left behind:** `hip-integration` itself was **not modified or reset**
-— `main` (this file) only. The `colmap-sift-cherrypick` branch (4 commits atop
-`hip-integration` tip `e8ad01ca`: `b1a3f26b`, `7dd7a7fc`, `66eaa995`, `77c6959f`)
-is kept, not deleted, and pushed to `origin` so the classification work and
-conflict resolution do not need to be redone. `hip-integration`'s own tip is
-confirmed an ancestor of `colmap-sift-cherrypick`
-(`git merge-base --is-ancestor hip-integration colmap-sift-cherrypick` → true,
-checked before writing this entry).
+**State left behind:** `hip-integration` was **not reset or force-pushed** —
+this entry (commit `57b26614`) is a single docs-only commit added normally on
+top of its prior tip `e8ad01ca`. The `colmap-sift-cherrypick` branch (4
+commits atop `hip-integration` tip `e8ad01ca`: `b1a3f26b`, `7dd7a7fc`,
+`66eaa995`, `77c6959f`, plus a docs commit `1682d716` adding
+`docs/superpowers/plans/track-c-task1-report.md`) is kept, not deleted, and
+pushed to `origin` so the classification work and conflict resolution do not
+need to be redone.
 
-**To resume:** a future session should attribute the fault to a specific
-kernel/API call (e.g. build with `-DCMAKE_BUILD_TYPE=RelWithDebInfo` for a
-symbolic backtrace, or bisect by reverting `3345a981`'s `BindTexture` switch
-in isolation against `e95eb380` alone) before deciding whether to fix the
-CuTexObj lifecycle directly or fall back to `BindTexture2D` with a padded/
-aligned pitch (the refactor `e95eb380`'s own commit message flagged as
+**Important — branches have since diverged, check before any fold-in:**
+`git merge-base --is-ancestor hip-integration colmap-sift-cherrypick` was
+confirmed true *before* this docs commit was pushed to `hip-integration`.
+Since `57b26614` landed only on `hip-integration` and is **not** present on
+`colmap-sift-cherrypick`, that ancestor relationship no longer holds. A
+future session must **not** run `git checkout hip-integration && git reset
+--hard colmap-sift-cherrypick` without first re-establishing it (e.g.
+`git rebase hip-integration colmap-sift-cherrypick`, then re-check
+`--is-ancestor`) — doing so blind would silently drop this docs entry.
+
+**To resume:** the most direct next diagnostic is a bisect within the 3
+cherry-picked commits — build with only `bf064e92` + `e95eb380` (drop
+`3345a981`'s `BindTexture2D` → `BindTexture` switch) and re-run the same
+2-image test. If it still faults, the bug is in `e95eb380`'s `CuTexObj`
+rule-of-five; if it's clean, `3345a981`'s linear-binding switch is the cause.
+Kernel-level attribution of the fault (which this session's
+`AMD_SERIALIZE_KERNEL=3` probe did not provide by itself) would need a
+symbolic debugger such as `rocgdb` attached to the abort, not simply a
+`RelWithDebInfo` rebuild. Also see the full write-up at
+`docs/superpowers/plans/track-c-task1-report.md` on the `colmap-sift-cherrypick`
+branch (the refactor `e95eb380`'s own commit message flagged as
 "left for a separate change").
