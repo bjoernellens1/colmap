@@ -89,3 +89,76 @@ full pipeline.
 
 Full pass/fail table and both raw ctest logs are in the Task 4 report:
 `.superpowers/sdd/2026-08-04-colmap-rocm-integration/task-4-report.md`.
+
+## Task 5: Rebase GPU SIFT branch onto hip-integration (2026-08-04)
+
+**Result: FALLBACK — rebase abandoned per the documented hard abort trigger.**
+`hip-integration` is unchanged; GPU SIFT (`jeffdaily/rocm-sift-gpu`) is **not** included.
+Task 6 proceeds with COLMAP's existing OpenGL/CPU SIFT frontend. PatchMatch-HIP (Task 3/4)
+and Caspar-HIP remain HIP-accelerated, so this is still a valid, partially-HIP-accelerated
+end-to-end pipeline — just not full-HIP-frontend.
+
+**Source:** `jeffdaily/rocm-sift-gpu`, 10 commits, ~115 commits behind `upstream/main` at
+plan-writing time (`git log --oneline jeffdaily/rocm-sift-gpu ^upstream/main | wc -l` → 10).
+
+**Assessment (Step 1):** `git diff upstream/main jeffdaily/rocm-sift-gpu --stat` showed a
+whole-repository-scale diff (CI workflows, benchmark scripts, docs, and core `src/colmap/mvs`
+and `src/colmap/util` files all touched) — expected fallout from 115 commits of upstream drift,
+not evidence by itself of a bad rebase.
+
+**Rebase attempt (Step 2):**
+```
+git checkout -b colmap-sift-rebase jeffdaily/rocm-sift-gpu
+git rebase hip-integration
+```
+Two of the ten commits (`786e0963`, `e609b9f1`) were skipped automatically as already applied
+(shared history with the PR #4420 lineage already on `hip-integration`). The very first commit
+actually replayed, `658f8b56` ("Add ROCm/HIP support for patch_match_stereo on AMD GPUs"),
+produced conflicts in **12 files**:
+
+```
+cmake/FindDependencies.cmake
+src/colmap/exe/CMakeLists.txt
+src/colmap/mvs/CMakeLists.txt
+src/colmap/mvs/cuda_flip.h
+src/colmap/mvs/cuda_rotate.h
+src/colmap/mvs/cuda_texture.h
+src/colmap/mvs/cuda_transpose.h
+src/colmap/mvs/gpu_mat.h
+src/colmap/mvs/patch_match_cuda.h
+src/colmap/util/CMakeLists.txt
+src/colmap/util/cuda.cc
+src/colmap/util/cudacc.cc
+src/colmap/util/cudacc.h
+```
+
+This exceeds the brief's hard abort trigger (>~5 files conflicted in a single commit) on the
+very first commit replayed — before any judgment call about resolution quality was even
+reachable. Per the brief: *"do not push through on a case-by-case 'am I confident' judgment
+call."* Stopped immediately.
+
+**Why this makes sense:** `jeffdaily/rocm-sift-gpu`'s own patch-match/CUDA-compat HIP work
+(`658f8b56` and friends) independently touches almost the exact same CUDA-compat surface
+(`cuda_flip.h`, `cuda_rotate.h`, `cuda_texture.h`, `cuda_transpose.h`, `gpu_mat.h`,
+`patch_match_cuda.h`, `util/cuda*.{cc,h}`) that PR #4420's PatchMatch-HIP port
+(already folded into `hip-integration`) rewrote. Two independent HIP ports of the same
+CUDA-compat layer, built 115 commits apart, is exactly the "double conflict" scenario the
+brief warned about in Step 1 — and it manifested on the first commit rather than being
+resolvable case-by-case.
+
+**Action taken (Step 3, fallback path):**
+```
+git rebase --abort
+git checkout hip-integration
+git branch -D colmap-sift-rebase
+```
+`hip-integration` working tree is clean and unchanged (`git status` confirms
+"nothing to commit, working tree clean", still tracking `origin/hip-integration`, no
+force-push performed — `upstream`/`origin` were never touched by this task).
+
+**Consequence for the plan:** Task 6 should run the pipeline with COLMAP's stock
+OpenGL/CPU SIFT extractor/matcher instead of HIP-accelerated SIFT. HIP acceleration still
+covers PatchMatch stereo (Task 3/4) and Caspar (separate task) — this remains a genuine
+partial-HIP end-to-end run, not a fully-CPU fallback. The plan's success criteria should be
+read as "HIP-accelerated PatchMatch + Caspar, CPU/OpenGL SIFT" rather than full-HIP-frontend,
+per this task's brief.
