@@ -4,14 +4,20 @@
 
 As of 2026-08-05, on this branch (`hip-integration`):
 
-- **HIP-accelerated:** dense stereo (`patch_match_stereo`) AND bundle adjustment
-  (`CASPAR` backend, native OpenCV camera-model support included from the start)
-  — both verified building and running correctly on real data on gfx1151. Caspar-HIP
-  BA closes the deferral noted below: it turned out to require build-system fixes
-  (three real, iterated-on bugs, see the Caspar-HIP Completion entries below), not
-  a fundamentally missing capability.
-- **CPU-only (not HIP):** feature extraction/matching only (SIFT — HIP SIFT attempt
-  documented below, cherry-pick abandoned; CPU/OpenGL SIFT remains the working path).
+- **HIP-accelerated:** dense stereo (`patch_match_stereo`), bundle adjustment
+  (`CASPAR` backend, native OpenCV camera-model support included from the start),
+  AND feature extraction/matching (`SiftGPU`) — all verified building and
+  running correctly on real data on gfx1151. GPU SIFT was previously a
+  documented fallback (crashed on buffer/texture reuse past the first image);
+  the real root cause has since been found and fixed with real diagnostic
+  evidence (`AMD_LOG_LEVEL` kernel-launch tracing), not a guess — see the
+  "GPU SIFT: real root cause and fix" entry below, which supersedes the two
+  "leading suspect" commits named in the original Track C Task 1 report and
+  that report's "bisect between them" recommendation (both are now known dead
+  ends: the actual bug is in a third, previously-unexamined kernel neither
+  commit touches). Caspar-HIP BA closes the deferral noted below: it turned
+  out to require build-system fixes (three real, iterated-on bugs, see the
+  Caspar-HIP Completion entries below), not a fundamentally missing capability.
 - Earlier entries below (particularly around Task 4 and the old Task 5/6 deferral
   notes) describe an intermediate state where Caspar-HIP was believed structurally
   blocked ("COLMAP vendors Caspar as CUDA-only generated source"). That assumption
@@ -829,3 +835,104 @@ directly reproducible from either repo's current state without recreating
 that Dockerfile (it mirrors `colmap-rocm`'s own `Dockerfile` but on a CUDA
 devel base with `-DCUDA_ENABLED=ON -DHIP_ENABLED=OFF
 -DCMAKE_CUDA_ARCHITECTURES=80`).
+
+## 2026-08-05: GPU SIFT — real root cause found and fixed, folded into `hip-integration`
+
+**Supersedes** the "documented fallback" outcome and the two "leading
+suspect" commits (`e95eb380`, `3345a981`) named in the 2026-08-04 Track C
+Task 1 entry above. Both commits are innocent; the report's recommended next
+step ("bisect within the 3 cherry-picked commits between these two") is now a
+known dead end — don't spend a future session on it.
+
+**Reproduced first,** with the same setup the prior report used (10-30 image
+subsets of `~/git/rosbag-colmap-pipeline/data/workspaces/table1/rgb/`,
+1280x720): confirmed the same "works on image 1, crashes with a `Page not
+present or supervisor privilege` GPU memory access fault a few images in"
+signature, `colmap-sift-cherrypick` branch, unmodified.
+
+**Real diagnostic signal:** ran with `AMD_LOG_LEVEL=3 HIP_LAUNCH_BLOCKING=1`
+(prints every HIP API call and kernel `ShaderName` to stderr as it's issued —
+no `rocgdb` needed to identify the faulting call, contrary to the prior
+report's assumption that a symbolic debugger was required). The trace showed
+the fault landing immediately after a `hipLaunchKernel` for
+`ListGen_Kernel(__hip_texture*, __hip_texture*, HIP_vector_type<int,4u>*, int, int)`
+— a kernel in `ProgramCU.cu`'s `GenerateList()`, part of
+`SiftPyramid::RunSIFT` → `GenerateFeatureList()`'s GPU list-compaction path
+(`GlobalUtil::_ListGenGPU == 1`), immediately preceded by two
+`hipCreateTextureObject` calls binding a growing pair of "list"/"histogram"
+linear-texture buffers. **Neither `e95eb380` nor `3345a981` touches this
+kernel or this call path at all** — both are scoped to `ComputeOrientation`
+and `ComputeDescriptor`'s texture-object lifecycle, several call frames away
+from where the fault actually occurs.
+
+**Root cause:** `ListGen_Kernel` (original upstream code, predates both
+cherry-picked commits, never previously exercised on HIP) launches a grid
+rounded up to a multiple of `LISTGEN_BLOCK_DIM`, so `idx1` can exceed
+`list_len` for the kernel's tail block. The only bounds check in the
+original code guards the *write* at the bottom of the kernel
+(`if (idx1 < list_len) d_list[idx1] = pos;`), but the *read* above it —
+`tex1Dfetch<int4>(texDataList, idx1)` — is unconditional. On CUDA, an
+out-of-range `tex1Dfetch` on a linear texture silently returns zero, so the
+tail threads' garbage `pos` is harmlessly discarded by the write guard. HIP
+has no such clamp-to-zero fallback: an out-of-range `tex1Dfetch` can read
+unmapped device memory and faults with exactly the "page not present"
+signature reproduced here. This explains the "works once, fails on reuse"
+shape purely as a **coincidence of allocation sizing**, not a lifecycle bug:
+whether the tail-thread OOB read happens to land on mapped or unmapped
+memory depends on how big the accumulated list/histogram buffers are for a
+given image, which only tends to grow (and cross onto unmapped pages) after
+the first image or two.
+
+**Two speculative fixes were tried and empirically ruled out before finding
+this** (both built and run, not just reasoned about): (1) a HIP-only
+`hipDeviceSynchronize()` added to `CuTexImage::CuTexObj`'s destructor and
+move-assignment (the initial hypothesis: HIP doesn't stream-order
+texture-object destruction against in-flight kernels the way CUDA does), and
+(2) an added `hipDeviceSynchronize()` at the top of
+`PyramidCU::BuildPyramid`, i.e. at the image boundary. Both changes shifted
+the fault later — deterministically from the 2nd processed image to the
+6th/7th — but neither eliminated it. That both a per-destroy sync and an
+image-boundary sync only delayed rather than fixed the fault is itself
+evidence against the race-condition hypothesis: a real missing
+synchronization would either always matter or never matter for a given
+buffer-size trajectory, not shift by exactly the amount of scheduling
+perturbation the sync itself introduced. Both speculative changes were
+reverted; they are not part of the final fix.
+
+**Fix (commit on `colmap-sift-cherrypick`, folded into `hip-integration` via
+rebase — see below):** clamp the tail-thread read index to `list_len - 1`
+before the first `tex1Dfetch` in `ListGen_Kernel`, gated under
+`#ifdef COLMAP_HIP_ENABLED` (this codebase's established convention for
+HIP-only behavior changes, keeping the CUDA path byte-identical to
+upstream). The fetched value for out-of-range threads is still discarded by
+the existing write guard, so in-range threads' results are unaffected —
+this is a minimal, surgical, one-`#if`-block diff.
+
+**Verification:**
+- 3 fresh-process runs (`docker run --rm`, no state carried between runs) of
+  `feature_extractor --FeatureExtraction.use_gpu 1` on 20 images from
+  `table1/rgb` (1280x720) — 3/3 completed all 20 images, zero faults,
+  correct nonzero keypoint counts on every image (range ~4600-9500 features,
+  no degenerate/zero counts).
+- 3 more fresh-process runs on 20 images from `freiburg1_desk/rgb` (640x480 —
+  different resolution, therefore a different feature-list buffer growth
+  trajectory than the first dataset, specifically chosen to probe for any
+  other unguarded read the first dataset's sizing sequence might not
+  exercise) — 3/3 completed cleanly, zero faults.
+- Re-verified after rebasing onto the current `hip-integration` tip (see
+  below): rebuilt fresh, re-ran 2 fresh-process runs per dataset (4 total) —
+  4/4 clean, zero faults. Verification on the pre-rebase tree does not
+  transfer to different surrounding code, so this re-run was not skipped.
+
+**Folded into `hip-integration`:** `colmap-sift-cherrypick`'s tip (previously
+7 commits ahead of a stale base, `hip-integration`'s old tip `e8ad01ca`, per
+the divergence warning in the 2026-08-04 entry above) was rebased onto the
+current `hip-integration` tip `734c7bea` — the branches had diverged by a
+whole Caspar-HIP + OpenCV milestone since. The rebase applied cleanly with
+**zero conflicts**. `hip-integration` was then fast-forwarded onto the
+rebased branch (`git merge --ff-only`, not `reset --hard`, and only after
+confirming `git merge-base --is-ancestor hip-integration
+colmap-sift-cherrypick` held true post-rebase) — a true fast-forward, not a
+history rewrite. GPU SIFT (`SiftGPU`) is therefore now part of
+`hip-integration`'s HIP-accelerated code paths, not a separate branch kept
+for a future session.
