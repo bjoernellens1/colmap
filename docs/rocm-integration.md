@@ -1152,3 +1152,37 @@ per-image-camera conditioning, not the BA backend.
 Artifacts from this check (30-image TUM freiburg1_desk subset, 2 GPU run
 dirs, 2 CPU run dirs, converted TXT models) were left in this session's
 scratchpad only, not committed to the repo or pushed anywhere.
+
+## 2026-08-05: rosbag-colmap-pipeline integration audit — no colmap-rocm bug found
+
+A downstream task assumed `global_mapper`'s log line
+(`Requested to use GPU for bundle adjustment, but COLMAP was compiled without
+CUDA support. Falling back to CPU-based solvers.`, seen when running the real
+`rosbag-colmap-pipeline` production orchestration, not raw `colmap` CLI) meant
+a CASPAR-vs-CUDA-only gate bug existed in `global_mapper`'s controller here.
+Investigation found no such bug: `CreateDefaultBundleAdjuster`
+(`src/colmap/estimators/bundle_adjustment.cc`) already dispatches on
+`#ifdef CASPAR_ENABLED`, independent of CUDA. The log line in question comes
+from an unrelated place — `bundle_adjustment_ceres.cc`/`global_positioning.cc`
+guard Ceres's own `ceres::CUDA` dense/sparse linear-algebra solver, a
+genuine Ceres-CUDA-only feature unrelated to Caspar; seeing that message on a
+HIP build is expected, correct behavior, not a bug.
+
+The real reason `global_mapper`'s Caspar path never engaged through that
+pipeline: `rosbag-colmap-pipeline`'s `runner.py` gates
+`--GlobalMapper.ba_backend CASPAR` behind a config key deliberately left
+unset by default, after a prior live accuracy sweep found it caused real
+reconstruction fragmentation on 2/3 tested scenes. That is a correct,
+intentional decision on the pipeline side, not a colmap-rocm defect — no
+code change made here.
+
+The pipeline's separate, already-safe-by-default standalone `bundle_adjuster
+--BundleAdjustment.backend CASPAR` pass (same mechanism verified directly
+against this branch in the Task 5 and full-pipeline-integration entries
+above) was confirmed to genuinely engage Caspar-HIP when correctly invoked
+end-to-end through `gttool run-colmap`, with a ~137x standalone-BA-stage
+speedup on the 613-frame `freiburg1_desk` scene (0.48s GPU/Caspar vs 65.6s
+CPU/Ceres). Full measurement and corrected end-to-end numbers are in
+`rosbag-colmap-pipeline`'s `docs/local-hip-run.md`
+("Corrected GPU-BA speedup measurement (2026-08-05)"), not duplicated here
+since this repo has no involvement in that fix.
