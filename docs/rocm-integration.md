@@ -1280,3 +1280,115 @@ where it starts failing — that threshold, cross-referenced against the
 the exact overflow. Not attempted here due to time; all reproduction
 artifacts (`in/`, `in_simple/`, `in_pinhole/`, `in_opencv_zero/`, and their
 `run_*.log`s) were left in this session's scratchpad only.
+
+## 2026-08-05: bisection refutes the scale-threshold hypothesis; bug reproduces at n=2 poses (still BLOCKED, evidence tightened)
+
+Follow-up on the entry above, which left "bisect by image/factor count to find
+the exact failure threshold" as the next step, on the theory (never actually
+tested) that the `-nan`-from-iteration-0 OPENCV bug was a buffer/shared-memory
+overflow that only manifested past some pose/factor-count threshold.
+
+**That hypothesis is now refuted.** Built a subsetting tool
+(`subset.py`, scratchpad-only) that takes the preserved 613-image/54458-point
+`freiburg1_desk` sparse model and produces a valid smaller COLMAP text model
+for the first N images: keeps only points3D with >=2 surviving observations,
+nulls out `POINT3D_ID` references in `images.txt` for any point that got
+dropped, and filters `frames.txt` to match (two real bugs in the first
+version of this tool — an off-by-one in the frames.txt header-line count, and
+dangling `POINT3D_ID` references — were caught and fixed before trusting any
+result; both produced clean crashes, not silent bad data, so they didn't
+contaminate any reported number below).
+
+Ran `bundle_adjuster --backend CASPAR` against N = 2, 5, 10, 20, 50, 100, 150,
+200, 250, 300, 350, 400, 450, 500, 550 (all still tagged `OPENCV`, same single
+shared camera, same fitted intrinsics from the real reconstruction). **Every
+single size failed identically** — `-nan` from `solver_iter: 0`,
+`CONVERGED_DIAG_EXIT` after 3 iterations, same signature as the full
+613-image case. This includes **N=2** (2 poses, 200 points, 208 factors) —
+about as small as a bundle adjustment problem can get. A fixed-size
+buffer/shared-memory overflow cannot explain a failure at N=2; that
+hypothesis, which was this investigation's leading theory as of the prior
+entry, is dead.
+
+**Confirmed the N=2 input itself is valid** by running the identical
+`in_2` directory through `--BundleAdjustment.backend CERES`: 100 real
+iterations, cost decreasing monotonically (`0.746px → 0.231px` per-residual,
+`NO_CONVERGENCE` only because of the 100-iteration cap), no nan. The data is
+fine; only Caspar's OPENCV path chokes on it.
+
+**Narrowed further: the bug is not in calibration-parameter refinement.**
+Re-ran `in_2` with `--BundleAdjustment.refine_focal_length 0
+--refine_extra_params 0` (on top of the already-default `refine_pp=0`),
+which forces the `FIXED_FAE_PP` variant — *only* poses and points are free;
+all 8 OpenCV intrinsic values are held fixed as constants for the entire
+solve. **Still failed identically** (`score_init: 4.605089e+02`, `-nan` from
+iteration 0). This rules out the calib/focal_and_extra Jacobian machinery
+entirely as the culprit — whatever's broken lives in the pose/point residual
+and Jacobian computation shared by every OpenCV variant, not in anything
+specific to intrinsics refinement.
+
+**Audited the GraphSolver construction call site for the
+positional-argument bug class the code's own comment warns about**
+(`caspar_model_adapter.h`'s `CreateSolver()`, `WARNING: Argument order is
+opaque and bug-prone...`). Compared every one of the ~60 positional
+arguments in `CreateSolver()`'s call to `caspar::GraphSolver(...)` against
+the constructor's parameter list in `generated/f32/solver.h` (lines
+~168-224): node-type-count order (OpenCVCalib, OpenCVFocalAndExtra,
+OpenCVPose, OpenCVPrincipalPoint, then Pinhole's four, then Point, then
+SimpleRadial's four) and factor-count order (simple_radial → pinhole →
+opencv → simple_radial_split → pinhole_split → opencv_split, each in the
+same fixed 4- or 11-variant sub-order) **match exactly, argument for
+argument.** No positional/ordering bug at this call site — this specific,
+plausible-looking hypothesis is ruled out with a direct side-by-side read,
+not just "looks fine."
+
+Also checked `SetupSolverData()` (`bundle_adjustment_caspar.cc`): pose,
+focal-and-extra, principal-point, and variant-factor node uploads are all
+driven generically through the `adapters_` map for every registered camera
+model, with no per-model special-casing that could silently skip OpenCV's
+upload — and the existing log line (`Camera 1 (OPENCV) params: [546.126,
+539.083, 320, 240, 0.151159, -0.260699, -0.0044668, -0.00178992] -> [same]`,
+seen on every run including the failing ones) independently confirms the
+source camera parameters read from `Reconstruction` are finite and correct
+before upload.
+
+**Status: still BLOCKED, but with the search space sharply reduced.** What's
+now ruled out: input data, problem scale/factor count (down to N=2), the
+calibration/intrinsics refinement path specifically, and the
+GraphSolver-construction argument-ordering class of bug. What remains
+implicated: the pose/point residual-and-Jacobian math itself, generated in
+`kernel_opencv_*res_jac*.cu` (and mirrored in `kernel_opencv_*score.cu`,
+since `score_current` — not just the Jacobian-derived step — comes back
+`-nan` too), for a real, non-scale-dependent, non-calib-related reason.
+Structural diffs already tried and found inconclusive: `__shared__
+inout_shared[16384]` sizing is identical between the OpenCV and Pinhole
+`_split_fixed_principal_point_res_jac_first.cu` variants; both use the same
+`copysign`-based epsilon-safe-division idiom seen elsewhere in this
+project's already-fixed HIP-specific `SumStore()` reduction
+(`generated/f32/memops.cuh`), which itself already carries this session's
+HIP-specific butterfly-reduction fix and looks correct on inspection.
+
+**Best-supported remaining hypothesis:** a genuine defect in the *math* of
+the OpenCV projection/residual formula as translated into the generated
+kernel — not a buffer, sizing, dispatch, or ordering bug — that produces a
+NaN (likely a 0/0 or similar degenerate operation) regardless of problem
+scale or which parameters are held fixed. Since it survives even with
+distortion coefficients hand-zeroed (prior entry) *and* with all intrinsics
+fixed as constants (this entry), whatever's wrong is specific to how the
+OpenCV kernel structures the pose/point part of its residual — plausibly
+something that differs between OpenCV's kernel and Pinhole/SimpleRadial's
+even though the surrounding scaffolding (shared-memory buffer, indices,
+`SumStore`) is templated identically.
+
+**Concrete next step for whoever picks this up:** the fast, decisive check
+is to instrument `kernel_opencv_split_fixed_principal_point_res_jac_first.cu`
+(or `kernel_opencv_res_jac_first.cu` for the BASE variant) directly with a
+`thread_idx==0`-gated `printf` of every intermediate register (`r0`...`r109`)
+for one factor of the `in_2` repro, and find the first one that goes NaN —
+that pins the exact faulty expression instead of continuing to eyeball
+~1400 lines of generated arithmetic. `in_2` (2 poses, 200 points, 208
+factors, runs in under a second) is now the reproduction case to use for
+that — not the 613-image case. All bisection subsets (`in_2` through
+`in_550`), their run logs, the CPU/Ceres control run, and `subset.py` were
+left in this session's scratchpad only (`ba_repro/`), not committed to the
+repo.
