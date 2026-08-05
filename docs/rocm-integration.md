@@ -24,6 +24,15 @@ As of 2026-08-05, on this branch (`hip-integration`):
   together was the last open gap this milestone. See "Full-pipeline
   integration verification" entry below — no fresh bug found; both features
   compose cleanly.
+- **Caspar-HIP's OpenCV distortion model (k1,k2,p1,p2) verified numerically
+  correct against real distorted-lens image data, 2026-08-05.** All prior
+  verification used `SIMPLE_RADIAL` data only, leaving the OpenCV dispatch
+  path's actual numerical correctness untested (a crash-free run alone
+  wouldn't rule out e.g. silently-zeroed distortion terms). Closed — see
+  "OpenCV camera-model numerical verification" entry below: fitted k1/k2/p1/p2
+  are non-degenerate and match the CPU/Ceres baseline within the same
+  fragmented-model artifacts CPU/Ceres also exhibits, i.e. this is a
+  dataset-conditioning characteristic, not a Caspar-HIP bug.
 - Earlier entries below (particularly around Task 4 and the old Task 5/6 deferral
   notes) describe an intermediate state where Caspar-HIP was believed structurally
   blocked ("COLMAP vendors Caspar as CUDA-only generated source"). That assumption
@@ -1029,3 +1038,117 @@ working, both individually and composed into one real pipeline run.
 Artifacts from this check (image `colmap-rocm:full-integration`, 30-image
 dataset, 3 run logs, CPU baseline run) were left in this session's scratchpad
 only, not committed to the repo or pushed anywhere.
+
+## OpenCV camera-model numerical verification (2026-08-05)
+
+Every prior BA verification on this branch ran on `SIMPLE_RADIAL` data. Caspar-HIP's
+native OpenCV camera-model support (k1,k2,p1,p2, ported from
+`rosbag-colmap-pipeline`'s caspar-opencv patch) had never been exercised against
+image data that actually has meaningful OpenCV-style distortion — a crash-free
+run alone wouldn't distinguish "distortion correctly optimized" from "distortion
+terms silently collapsed to near-zero," a subtler bug than a crash.
+
+**Dataset:** 30 frames sampled (every 20th of 613) from
+`rosbag-colmap-pipeline`'s local `docker/workspaces/freiburg1_desk` — the raw
+RGB images from TUM's `rgbd_dataset_freiburg1_desk` sequence. TUM's published
+calibration for this camera (fx≈517.3, fy≈516.5, cx≈318.6, cy≈255.3,
+k1≈0.2624, k2≈−0.9531, p1≈−0.0054, p2≈0.0026) has real, non-negligible radial
+distortion — a legitimate OpenCV-model test case, not a near-pinhole lens.
+(`floor2`, the other candidate mentioned for this check, lives only on the
+cluster's NFS workspace path and wasn't pulled locally for this quick check.)
+
+**Commands** (both backends, both forcing the OpenCV model explicitly):
+```
+colmap feature_extractor --ImageReader.camera_model OPENCV --database_path db.db --image_path images --FeatureExtraction.use_gpu {0,1}
+colmap exhaustive_matcher --database_path db.db --FeatureMatching.use_gpu {0,1}
+colmap mapper --database_path db.db --image_path images --output_path sparse --Mapper.ba_global_backend {CASPAR,CERES}
+```
+Image `colmap-rocm:full-integration` (matches this branch's tip, `1218282`),
+same env flags as prior full-pipeline check. 2 fresh-process GPU/Caspar-HIP
+runs plus 2 fresh-process CPU/Ceres baseline runs, all on the identical
+30-image set with `--ImageReader.camera_model OPENCV` forced on both sides
+(default per-image-camera COLMAP behavior — `ImageReader.single_camera` was
+*not* set, so each image gets its own independently-fit OPENCV camera; this
+matters for reading the per-camera intrinsics below).
+
+**Note on the conversion step:** `colmap model_converter` against the bind-mounted
+output silently produced `Could not open .../cameras.bin` and aborted unless
+`--security-opt label=disable` was also passed to that container invocation
+(the pipeline runs had it; my first conversion attempts didn't) — an SELinux
+labeling gotcha on this host, not a COLMAP/Caspar bug, worth a note for anyone
+re-running this later without that flag.
+
+**Results — registered images / points, both fragmented into 2 sub-models each run:**
+
+| run | backend | model0 imgs/pts | model1 imgs/pts | total registered |
+|-----|---------|---|---|---|
+| GPU run 1 | Caspar-HIP | 2 / 38 | 28 / 1596 | 30/30 |
+| GPU run 2 | Caspar-HIP | 6 / 187 | 18 / 1090 | 24/30 |
+| CPU run 1 | Ceres | 6 / 223 | 19 / 1325 | 25/30 |
+| CPU run 2 | Ceres | 2 / 151 | 20 / 1364 | 22/30 |
+
+Registration counts vary run-to-run on **both** backends (not just Caspar-HIP)
+because `--ImageReader.single_camera` wasn't set and initial-pair/registration-order
+choice is sensitive with only 30 sparse, wide-baseline frames — this is expected
+incremental-SfM behavior with per-image cameras, not new nondeterminism in the
+Caspar-HIP path itself (the earlier SIMPLE_RADIAL full-pipeline check used the
+same dataset scale and also saw run-to-run variation in which images registered,
+just with a shared single camera so it wasn't visible in per-camera params).
+
+**Reprojection error, main (largest) sub-model each run:**
+
+| run | backend | mean reproj. error | points |
+|---|---|---|---|
+| GPU run 1 | Caspar-HIP | 0.753 px | 1596 |
+| GPU run 2 | Caspar-HIP | 0.814 px | 1090 |
+| CPU run 1 | Ceres | 0.666 px | 1325 |
+| CPU run 2 | Ceres | 0.658 px | 1364 |
+
+Same ~0.75-0.81px (GPU) vs. ~0.66px (CPU) pattern already established
+elsewhere in this log for SIMPLE_RADIAL data — same order of magnitude, no
+regression from forcing OPENCV.
+
+**Distortion-coefficient sanity check (the critical check this session was
+dispatched to close):** in each run's main sub-model (18-28 images sharing a
+pool of per-image OPENCV cameras), fitted values cluster tightly and
+plausibly on **both** backends:
+
+- GPU run 1 (28 cameras): fx/fy mostly 480-580, k1 range 0.009-0.38, k2 range
+  −0.10 to −0.95, p1/p2 small (~0.001-0.06) — e.g. camera 6:
+  `548.03 528.24 320 240 0.1219 -0.2511 0.01663 -0.00062`.
+- CPU run 1 (19 cameras): fx/fy mostly 505-535, k1 range 0.08-0.62, k2 range
+  −0.16 to −1.39, p1/p2 similarly small — e.g. camera 4:
+  `526.44 517.09 320 240 0.1376 -0.2405 -0.0052 -0.0027`.
+
+Both backends land in the same regime as TUM's published ground truth
+(k1≈0.26, k2≈−0.95) — **not** collapsed to zero, and not blown up, confirming
+Caspar-HIP's OpenCV dispatch path is genuinely optimizing all four distortion
+terms, matching Ceres' behavior on the same forced-OPENCV data.
+
+**A real (pre-existing, backend-agnostic) artifact, correctly ruled out as a
+Caspar-HIP bug:** the *small* sub-model in every run — GPU and CPU alike —
+contains 1-2 badly degenerate cameras (e.g. GPU run 2's camera 19:
+`fx=62197 fy=55249 cx=320 cy=240 k1=13677 k2=-451824192 ...`; CPU run 1's
+camera 19: `fx=292129 k1=233189 k2=-2158855`). This is not a GPU-only or
+Caspar-only failure — Ceres produces equally degenerate fits on the same
+small sub-models. Root cause: with `single_camera` unset and only 2-6 images
+sharing a camera in these fragments, OpenCV's 8 free parameters (fx,fy,cx,cy,
+k1,k2,p1,p2) are underconstrained by the available correspondences, so BA
+finds a degenerate local minimum regardless of solver backend. This is a
+dataset-conditioning/config characteristic of forcing per-image OPENCV
+cameras on a sparse, fragmented reconstruction — not something this
+verification pass should chase further, since it reproduces identically on
+CPU/Ceres.
+
+**Verdict: PASS — OpenCV numerical-verification gap closed.** Caspar-HIP's
+OpenCV distortion dispatch path produces registered-image counts, reprojection
+error, and fitted k1/k2/p1/p2 values consistent with the CPU/Ceres baseline on
+the same real distorted-lens data, across 2 independent fresh-process runs per
+backend. No evidence of distortion terms being silently zeroed or of a
+Caspar-HIP-specific numerical bug; the one artifact found (degenerate small
+sub-model cameras) is reproduced identically on Ceres and traced to sparse
+per-image-camera conditioning, not the BA backend.
+
+Artifacts from this check (30-image TUM freiburg1_desk subset, 2 GPU run
+dirs, 2 CPU run dirs, converted TXT models) were left in this session's
+scratchpad only, not committed to the repo or pushed anywhere.
