@@ -1180,9 +1180,103 @@ The pipeline's separate, already-safe-by-default standalone `bundle_adjuster
 --BundleAdjustment.backend CASPAR` pass (same mechanism verified directly
 against this branch in the Task 5 and full-pipeline-integration entries
 above) was confirmed to genuinely engage Caspar-HIP when correctly invoked
-end-to-end through `gttool run-colmap`, with a ~137x standalone-BA-stage
-speedup on the 613-frame `freiburg1_desk` scene (0.48s GPU/Caspar vs 65.6s
-CPU/Ceres). Full measurement and corrected end-to-end numbers are in
+end-to-end through `gttool run-colmap`, initially measured at ~137x
+standalone-BA-stage speedup on the 613-frame `freiburg1_desk` scene (0.48s
+GPU/Caspar vs 65.6s CPU/Ceres). **That number is not trustworthy — confirmed
+2026-08-05 as a real correctness bug, not a genuine speedup**: on this scene
+Caspar's solver returns nan cost from the first iteration, never accepts a
+single LM step, and exits after 3 iterations having written back the
+unmodified input model (reprojection error unchanged from baseline). See
 `rosbag-colmap-pipeline`'s `docs/local-hip-run.md`
-("Corrected GPU-BA speedup measurement (2026-08-05)"), not duplicated here
-since this repo has no involvement in that fix.
+("Correctness follow-up (2026-08-05)") for the full same-input Ceres-vs-Caspar
+comparison and evidence; not duplicated here since this repo has no
+involvement in that fix.
+
+## 2026-08-05: Caspar-HIP `-nan`-from-iteration-0 bug isolated to the OPENCV kernel family (root cause not fully found — BLOCKED with strong evidence)
+
+Follow-up on the entry above. Reproduced the failure directly against this
+branch's tip (`localhost/colmap-rocm:full-integration`, matches
+`1218282`/`95b76dc0`, docs-only commit in between) by feeding the preserved
+post-`global_mapper` `freiburg1_desk` sparse model (613 images, 54458 points,
+634857 factors, single shared `OPENCV` camera) straight into
+`colmap bundle_adjuster --BundleAdjustment.backend CASPAR --log_level 2`.
+Confirmed the exact reported signature: `score_init: 4.548663e+05`,
+`score_current: -nan` from `solver_iter: 0`, `step_quality: 0.000` on every
+iteration, `diag` climbing 1→2→8 until `CONVERGED_DIAG_EXIT` after 3 iters,
+output bit-identical to input.
+
+**Input data ruled out first (cheap check, per plan).** Parsed `points3D.txt`
+and `images.txt` directly: zero NaN/Inf in any point coordinate, all 635192
+observations have positive camera-frame depth (min `z = 0.898`), max
+normalized-image-plane radius² across all observations is `0.53` (nowhere
+near the range where a `k2·r⁴` term would threaten float32 range). The input
+model is clean — this is not a garbage-in-garbage-out problem.
+
+**Scale ruled out as the trigger** by re-running the *identical* 613-pose/
+54458-point problem with the camera model swapped to `SIMPLE_RADIAL` (same
+image observations, hand-edited `cameras.txt`, no re-extraction). Result:
+score decreases genuinely over 200 iterations (`4.7e5 → 4.6999e5`,
+`MAX_ITERATIONS` exit, not `CONVERGED_DIAG_EXIT`), with occasional isolated
+`nan`/`-nan` iterations correctly rejected (`step_quality: 0.000`) and
+recovered from on the next iteration — this is precisely the already-diagnosed
+*benign* symforce-rocm nan artifact, not the bug. Repeating the same test with
+the camera forced to `PINHOLE` (4 params, no distortion) gave the same
+healthy behavior: 200 real iterations, genuine convergence, only benign
+transient nans. **So at this exact scale/shape, both `SIMPLE_RADIAL` and
+`PINHOLE` bundle-adjust correctly; only `OPENCV` fails outright.**
+
+**Distortion coefficients ruled out as the trigger.** Re-ran the real 613-pose
+problem with the camera still tagged `OPENCV` but all four distortion
+params (`k1,k2,p1,p2`) hand-zeroed (mathematically equivalent to `PINHOLE`).
+Still failed identically: `-nan` from iteration 0, `CONVERGED_DIAG_EXIT` after
+3 iters. So the defect is not in the distortion-term math (k1/k2/p1/p2
+values) — it reproduces even when those terms are numerically inert.
+
+**Variant dispatch ruled out as the sole trigger.** Ran the real problem with
+`--BundleAdjustment.refine_principal_point 1`, which switches Caspar from the
+`FIXED_PP` factor variant (`kernel_opencv_split_fixed_principal_point_*`) to
+the `BASE` variant (`kernel_opencv_res_jac*`, no `_split_` in the name) —
+different generated kernel files entirely. Same failure, same signature. Both
+`OPENCV` variants tested fail; both non-`OPENCV` models tested at the same
+scale succeed.
+
+**Conclusion: the bug is specific to Caspar's `OPENCV`-camera-model kernel
+family (`src/thirdparty/Symforce-Caspar/generated/f32/kernel_opencv_*.cu`),
+triggered by this problem's scale/shape (613 poses, 54458 points, 634857
+factors) — not by scale alone (SIMPLE_RADIAL/PINHOLE are fine at the same
+scale), not by camera model alone (Track B's 30-image OPENCV check with real
+distortion passed), and not by the distortion values (fails with distortion
+zeroed too).** This narrows it to something structural in how the `OPENCV`
+kernels specifically handle a factor set this large — the OPENCV model is the
+only one of the three with 8 intrinsic parameters (vs. 4 for PINHOLE/
+SIMPLE_RADIAL), giving its per-factor kernels a materially larger
+register/shared-memory footprint per thread block
+(`kernel_opencv_split_fixed_principal_point_res_jac_first.cu` alone declares
+~110 scalar temporaries plus a `16384`-byte `__shared__ inout_shared` buffer
+per block). A buffer/stride sizing formula correct for PINHOLE/SIMPLE_RADIAL's
+smaller footprint but wrong for OPENCV's larger one — only manifesting once
+the factor/thread-block count crosses some threshold between 30-image and
+613-image scale — is the leading hypothesis, consistent with the same class
+of HIP shared-memory scratch-buffer bug already found and fixed once this
+session in symforce-rocm (a different specific instance, not the same code).
+Also worth noting structurally: the `f64` (`CASPAR_USE_DOUBLE`) solver variant
+has **zero** generated `OPENCV` kernels at all (`find .../generated/f64
+-iname '*opencv*'` returns nothing, vs. dozens under `f32`) — `OPENCV` support
+only exists in single precision in this codebase. This wasn't confirmed as
+the trigger (`SIMPLE_RADIAL`/`PINHOLE` also ran in f32, the project's default,
+and were fine), but it means there is no double-precision fallback available
+to sidestep the bug by rebuilding, and is worth fixing/generating regardless.
+
+**Status: BLOCKED — root cause narrowed to a specific kernel family and
+scale-dependent trigger, but the exact defect inside the ~1400-line
+generated `kernel_opencv_*_res_jac*.cu`/`.h` files was not pinned down to a
+line number.** Next step for whoever picks this up: instrument
+`bundle_adjustment_caspar.cc`'s `CASPAR SOLVER SETUP` block to dump the raw
+factor/pose/point buffers sent to Caspar for the `OPENCV` path immediately
+before `Solve()`, and bisect the 613-image problem size down (e.g. 100, 200,
+400 images) with `OPENCV` forced, to find the exact factor-count threshold
+where it starts failing — that threshold, cross-referenced against the
+`__shared__`/register allocation in the generated kernels, should point at
+the exact overflow. Not attempted here due to time; all reproduction
+artifacts (`in/`, `in_simple/`, `in_pinhole/`, `in_opencv_zero/`, and their
+`run_*.log`s) were left in this session's scratchpad only.
