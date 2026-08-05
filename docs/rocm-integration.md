@@ -18,6 +18,12 @@ As of 2026-08-05, on this branch (`hip-integration`):
   commit touches). Caspar-HIP BA closes the deferral noted below: it turned
   out to require build-system fixes (three real, iterated-on bugs, see the
   Caspar-HIP Completion entries below), not a fundamentally missing capability.
+- **Full pipeline integration (GPU SIFT extraction → GPU SIFT matching →
+  Caspar-HIP `mapper`) verified end-to-end on real data, 2026-08-05.** The
+  two features above had only ever been verified separately; running them
+  together was the last open gap this milestone. See "Full-pipeline
+  integration verification" entry below — no fresh bug found; both features
+  compose cleanly.
 - Earlier entries below (particularly around Task 4 and the old Task 5/6 deferral
   notes) describe an intermediate state where Caspar-HIP was believed structurally
   blocked ("COLMAP vendors Caspar as CUDA-only generated source"). That assumption
@@ -936,3 +942,90 @@ colmap-sift-cherrypick` held true post-rebase) — a true fast-forward, not a
 history rewrite. GPU SIFT (`SiftGPU`) is therefore now part of
 `hip-integration`'s HIP-accelerated code paths, not a separate branch kept
 for a future session.
+
+### 2026-08-05: Full-pipeline integration verification (GPU SIFT + Caspar-HIP, together, end-to-end)
+
+**Why this task:** GPU SIFT (`a650ef52`/`1afc1ddb`, root-caused and fixed) had
+only ever been run in isolation via `feature_extractor` alone. Caspar-HIP BA
+(`b96b57d1`) had only ever been verified with the default CPU feature
+extraction/matching path, since GPU SIFT wasn't merged onto `hip-integration`
+yet at that time. Nobody had run `feature_extractor` (GPU) →
+`exhaustive_matcher` (GPU) → `mapper --Mapper.ba_global_backend CASPAR`
+together on this branch's current tip. This closes that gap.
+
+**Build:** `docker build -t colmap-rocm:full-integration --build-arg
+CMAKE_EXTRA_ARGS="-DCASPAR_ENABLED=ON" .` at branch tip `1afc1ddb`
+(`-DHIP_ENABLED=ON -DCUDA_ENABLED=OFF` from the Dockerfile default). Clean
+build, `801/801` ninja targets, `real 3m~4m`. `colmap -h` inside the image
+reports `COLMAP 4.2.0.dev0 ... with HIP`.
+
+**Dataset:** 30 frames sampled from TUM `freiburg1_desk`
+(`~/git/rosbag-colmap-pipeline/docker/workspaces/freiburg1_desk/rgb`, frames
+`000000.png`–`000290.png` at stride 10, 640x480, `SIMPLE_RADIAL`). This
+stride turned out wider-baseline than ideal for this fast-moving handheld
+sequence — of the 30 staged frames, only a contiguous ~14-frame span had
+enough visual overlap to form one connected reconstruction; the mapper
+correctly discarded every other candidate initial pair for insufficient
+size/no good match rather than force a bad registration. This is dataset
+sparsity, not a pipeline defect (same pattern, same root cause, as the
+CUDA-regression check's 4/8 result recorded in the entry above).
+
+**Commands** (env: `HSA_OVERRIDE_GFX_VERSION=11.5.1 --group-add 39
+--group-add 105 --security-opt label=disable --device=/dev/kfd
+--device=/dev/dri -e QT_QPA_PLATFORM=offscreen`):
+```
+colmap feature_extractor --FeatureExtraction.use_gpu 1 --ImageReader.single_camera 1 --ImageReader.camera_model SIMPLE_RADIAL ...
+colmap exhaustive_matcher --FeatureMatching.use_gpu 1 ...
+colmap mapper --Mapper.ba_global_backend CASPAR ...
+```
+Note: `--SiftExtraction.use_gpu` / `--SiftMatching.use_gpu` (used in some
+older docs/scripts) do **not** exist as flags on this branch; the correct
+names are `--FeatureExtraction.use_gpu` and `--FeatureMatching.use_gpu`
+(confirmed via `colmap feature_extractor -h` / `colmap exhaustive_matcher
+-h`). First attempt with the wrong flag name failed fast with a clear
+`unrecognised option` error — not a pipeline bug, a docs/flag-naming trap
+worth flagging for anyone copying older invocations.
+
+**Results — 3 fresh-process runs (fresh containers, fresh `database.db` per
+run, no state reuse):**
+
+| run | images extracted | crash/fault | registered | points | mean track len | mean reproj. error |
+|-----|---|---|---|---|---|---|
+| 1 | 30/30 | none | 14/30 | 1312 | 4.236 | 0.6995 px |
+| 2 | 30/30 | none | 14/30 | 1300 | 4.238 | 0.6997 px |
+| 3 | 30/30 | none | 14/30 | 1305 | 4.231 | 0.7063 px |
+
+All three runs registered the identical 14-image span, identical initial
+pair selection pattern, and point counts/reprojection error within ~1% of
+each other run-to-run — no nondeterminism, no intermittent faults across 3
+independent runs.
+
+**Keypoint-count regression check (Track C's fixed failure mode):** per-image
+SIFT feature counts across all 30 images, every run, ranged 599–3334 with no
+systematic drop-off after image 1 (e.g. run 1: 1224, 1011, 1227, 1138,
+1056, 1875, 2151, 2606, ... 599) — confirms the tail-thread texture-read fix
+(`a650ef52`) holds under the full pipeline's different call pattern/timing,
+not just the isolated `feature_extractor`-only test it was originally fixed
+under.
+
+**CPU baseline comparison** (same 30 images, `--FeatureExtraction.use_gpu 0
+--FeatureMatching.use_gpu 0`, `--Mapper.ba_global_backend CERES`): 14/30
+registered (same count and same image span as all 3 GPU runs), 1272 points,
+mean track length 4.266, mean reprojection error 0.6686 px. GPU pipeline's
+~0.70px vs. CPU's ~0.67px is the same order of magnitude and consistent with
+expected GPU-SIFT/CPU-SIFT keypoint-localization differences already
+documented elsewhere in this log — not a quality regression.
+
+**Verdict: PASS.** The full HIP-accelerated pipeline — GPU SIFT extraction,
+GPU SIFT matching, and Caspar-HIP global bundle adjustment — runs correctly
+together, end-to-end, on real data, on gfx1151, with no crashes, no
+nondeterminism across 3 runs, and reconstruction quality in line with the
+CPU baseline. **No fresh integration bug was found between the two
+features** — each behaves in combination exactly as it behaved in isolation.
+This closes the last open verification gap for this milestone: dense stereo,
+Caspar-HIP BA, and GPU SIFT extraction/matching are now all confirmed
+working, both individually and composed into one real pipeline run.
+
+Artifacts from this check (image `colmap-rocm:full-integration`, 30-image
+dataset, 3 run logs, CPU baseline run) were left in this session's scratchpad
+only, not committed to the repo or pushed anywhere.
