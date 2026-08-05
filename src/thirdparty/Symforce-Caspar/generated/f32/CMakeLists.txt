@@ -44,6 +44,16 @@ if(USE_HIP)
   # Link hip targets PRIVATE to avoid propagating HIP compile options to pure-CXX consumers.
   # The static library has the HIP code linked in; pybind consumers only need the includes.
   target_link_libraries(caspar_lib_core PRIVATE hip::host hip::hipcub)
+  # LOCAL PATCH (hip-integration branch, 2026-08-05) -- do not lose this on
+  # regeneration; see docs/rocm-integration.md Task 4. Everything else in
+  # this if(USE_HIP) branch (find_package(hip)/find_package(hipcub),
+  # LANGUAGE HIP source properties, HIP_ARCHITECTURES) comes from
+  # symforce-rocm's own codegen templates unconditionally -- only the
+  # get_target_property(hip::host ...)/ROCM_PATH-fallback lookup below,
+  # through the end of this if(USE_HIP) block, is a hand-patch replacing a
+  # no-op ${hip_INCLUDE_DIRS} expression. Re-running generate_caspar.py from
+  # an unpatched symforce-rocm codegen template will silently drop it.
+  #
   # Expose ROCm include directory for consumers that need hipError_t etc.
   # NOTE: ${hip_INCLUDE_DIRS} is not actually set by modern find_package(hip)
   # (which only populates the hip::host imported target's own

@@ -14,6 +14,17 @@
 #if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
 
 #include <hip/hip_runtime.h>
+// LOCAL PATCH (hip-integration branch, 2026-08-05) -- do not lose this on
+// regeneration; see docs/rocm-integration.md Task 4. The `#if
+// defined(__HIPCC__)` guards below (here and at line ~55) were hand-added
+// to gate the hip_cooperative_groups.h/hipcub.hpp includes and the cub/cg
+// aliases they enable: without the guard, plain host C++ translation units
+// that only need this header for host-visible declarations (e.g. colmap's
+// bundle_adjustment.cc via solver.h) fail with `'__device__' does not name
+// a type`, since only a HIP-aware compiler pass can parse those headers'
+// device-only code. Re-running generate_caspar.py from an unpatched
+// symforce-rocm codegen template will silently drop this guard and
+// reintroduce that failure -- see I2 in the final branch review.
 // hip_cooperative_groups.h and hipcub/hipcub.hpp declare __device__ code
 // (device-only intrinsics, templated kernels) that only a HIP-aware
 // compiler pass (__HIPCC__, defined automatically by hipcc/clang++ --hip)

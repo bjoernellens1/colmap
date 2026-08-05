@@ -190,24 +190,42 @@ elseif(CASPAR_ENABLED AND HIP_ENABLED)
     # compat header, shipped by symforce-rocm's codegen templates as of this
     # branch's regeneration -- see the Track B Task 2 commit) is found via
     # the generated kernels' `#include "cuda_to_hip.h"`.
-    set_target_properties(caspar_lib_core PROPERTIES
-        INTERFACE_INCLUDE_DIRECTORIES "$<BUILD_INTERFACE:${CASPAR_GEN_DIR}>")
-    # The set_target_properties() call above OVERWRITES (not appends to)
-    # INTERFACE_INCLUDE_DIRECTORIES, wiping out the ROCm include directory
-    # the generated CMakeLists.txt's own target_include_directories(...
-    # PUBLIC ...) call added for consumers that need <hip/hip_runtime.h>
-    # (e.g. colmap's bundle_adjustment.cc, via solver.h -> cuda_to_hip.h,
-    # which is a plain C++ translation unit with no implicit HIP-compiler
-    # sysroot knowledge). Re-add it here with target_include_directories(),
-    # which appends, so it survives.
-    if(DEFINED ROCM_PATH AND EXISTS "${ROCM_PATH}/include/hip/hip_runtime.h")
-        target_include_directories(caspar_lib_core PUBLIC "${ROCM_PATH}/include")
+    #
+    # Use target_include_directories() (appends to
+    # INTERFACE_INCLUDE_DIRECTORIES), NOT set_target_properties() (which
+    # would overwrite it wholesale). The generated CMakeLists.txt at
+    # ${CASPAR_GEN_DIR}/CMakeLists.txt already populated this property with
+    # the ROCm include directory (looked up from hip::host's own
+    # INTERFACE_INCLUDE_DIRECTORIES, falling back to ROCM_PATH) so that
+    # pure-C++ consumers of caspar_lib_core (e.g. colmap's
+    # bundle_adjustment.cc, via solver.h -> cuda_to_hip.h, which has no
+    # implicit HIP-compiler sysroot knowledge) can find <hip/hip_runtime.h>.
+    # An overwrite here would silently wipe that out and, on ROCm installs
+    # where headers aren't at the literal ${ROCM_PATH}/include/hip path
+    # (e.g. a pip/TheRock ROCm found via `rocm-sdk path --root`), degrade to
+    # a hard compile failure instead of using the more robust
+    # hip::host-target-property lookup.
+    #
+    # The generated CMakeLists.txt's own add_library() call also added
+    # ${CMAKE_CURRENT_SOURCE_DIR} (== CASPAR_GEN_DIR) to
+    # INTERFACE_INCLUDE_DIRECTORIES unwrapped (not inside a BUILD_INTERFACE
+    # generator expression). CMake's install(EXPORT) validation rejects any
+    # raw absolute path there that's inside the source tree ("... which is
+    # prefixed in the source directory"), so strip that raw entry and
+    # replace it with the BUILD_INTERFACE-wrapped form -- this preserves
+    # every other entry already on the property (in particular the ROCm
+    # include directory the generated CMakeLists.txt added for hip_runtime.h)
+    # instead of overwriting the whole list.
+    get_target_property(_caspar_ifaces caspar_lib_core INTERFACE_INCLUDE_DIRECTORIES)
+    if(_caspar_ifaces)
+        list(REMOVE_ITEM _caspar_ifaces "${CASPAR_GEN_DIR}")
     else()
-        message(WARNING
-            "Caspar-HIP: ROCM_PATH ('${ROCM_PATH}') does not contain "
-            "include/hip/hip_runtime.h -- pure-C++ consumers of "
-            "caspar_lib_core may fail to find <hip/hip_runtime.h>.")
+        set(_caspar_ifaces "")
     endif()
+    list(APPEND _caspar_ifaces "$<BUILD_INTERFACE:${CASPAR_GEN_DIR}>")
+    set_target_properties(caspar_lib_core PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${_caspar_ifaces}")
+    unset(_caspar_ifaces)
     # HIP-language translation units get __HIP_PLATFORM_AMD__ defined
     # implicitly by the HIP compiler wrapper; plain CXX translation units
     # (e.g. colmap's bundle_adjustment.cc, via solver.h -> cuda_to_hip.h,

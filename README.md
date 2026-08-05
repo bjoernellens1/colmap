@@ -29,8 +29,9 @@ Download
 * **Python bindings** are available at https://pypi.org/project/pycolmap.
   CUDA-enabled wheels are available at https://pypi.org/project/pycolmap-cuda12.
   AMD GPUs accelerate dense reconstruction via HIP/ROCm when building from
-  source (see install docs); feature extraction/matching and bundle
-  adjustment currently run on CPU on a HIP build.
+  source (see install docs); feature extraction/matching remain CPU-only on
+  a HIP build, but bundle adjustment is HIP-accelerated via the optional
+  Caspar backend (build-time opt-in, `-DCASPAR_ENABLED=ON`, off by default).
 * To **build from source**, please see https://colmap.github.io/install.html.
 
 Getting Started

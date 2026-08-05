@@ -564,9 +564,17 @@ cooperative_groups lacks. This substantially changed Task 4's scope from
 "write a compat header from scratch" to "fix real build-system wiring bugs
 around an already-correct header" (see Task 4 below).
 
-PINHOLE/SIMPLE_RADIAL kernel logic itself is unchanged versus the prior
-committed tree — the diff there is clang-format-style reformatting plus the
-`cuda_to_hip.h`/`USE_HIP` additions only, not a logic regression.
+PINHOLE/SIMPLE_RADIAL: the mechanical per-node kernels are pure reformatting
+versus the prior committed tree (clang-format-style whitespace/comments plus
+the `cuda_to_hip.h`/`USE_HIP` additions, no logic change). The
+reprojection-residual/score kernels (`*_res_jac`, `*_res_jac_first`,
+`*_score`) are not textually identical, though — 90 pre-existing generated
+files there still differ in actual generated-code content after normalizing
+whitespace/comments/includes, showing expression-ordering differences (e.g.
+register count changes) from symforce/symengine codegen-version drift, not a
+hand edit and not a semantic bug (both gfx1151 HIP and A100 CUDA builds ran
+these kernels successfully this milestone). Do not assume regeneration is a
+no-op diff for these files.
 
 Re-verified Task 1's `CreateSolver()` positional-argument port against the
 now-OpenCV-augmented `solver.h`'s actual `GraphSolver` constructor: node-type
@@ -636,6 +644,36 @@ and fixed, none suppressed:
    be written from scratch, but still needed this host/device-compile-mode
    fix specific to how colmap-rocm's build reaches this header from plain
    C++ translation units.
+
+**Final-branch-review follow-up (2026-08-05):** the fix-#2 `set_target_properties`
+overwrite and the fix-#3 `__HIPCC__` guard were both hand-patches on
+generated/vendored files with no warning banner, so a future
+`generate_caspar.py` regeneration would have silently reintroduced both bugs.
+Added `LOCAL PATCH` comment banners at both patch sites
+(`src/thirdparty/CMakeLists.txt` and
+`src/thirdparty/Symforce-Caspar/generated/f32/cuda_to_hip.h`), and — since
+the `__HIPCC__` guard fix is small and self-contained — also applied it
+directly to `symforce-rocm`'s own codegen template
+(`symforce/caspar/source/runtime/cuda_to_hip.h`, `hip-integration` branch,
+commit `bdc65218`), so future regeneration produces the guard correctly
+without needing the downstream hand-patch at all. The
+`set_target_properties`-overwrite fix (I1) is colmap-rocm-specific build
+wiring, not a symforce-rocm codegen issue, so it stays local to this repo
+only (see fix #2 above). It also needed a follow-up once actually rebuilt:
+naively switching the overwrite to `target_include_directories()` (append)
+left the *generated* `CMakeLists.txt`'s own unwrapped
+`${CMAKE_CURRENT_SOURCE_DIR}` entry (added by its plain
+`add_library()`/`target_include_directories()` call, not `BUILD_INTERFACE`-
+wrapped) sitting in `INTERFACE_INCLUDE_DIRECTORIES` alongside the new
+wrapped one -- which CMake's `install(EXPORT)` validation rejects outright
+("... which is prefixed in the source directory"). The old overwrite had
+been accidentally masking this pre-existing bug in the generated file by
+discarding that raw entry along with everything else. Fixed by reading back
+the current `INTERFACE_INCLUDE_DIRECTORIES` list, removing the raw
+`CASPAR_GEN_DIR` entry with `list(REMOVE_ITEM)`, and re-adding it
+`BUILD_INTERFACE`-wrapped -- preserving every other entry already on the
+property, in particular the ROCm include directory the generated
+`CMakeLists.txt` had added for `<hip/hip_runtime.h>`.
 
 Verified: `docker build -t colmap-rocm:caspar-hip --build-arg CMAKE_EXTRA_ARGS="-DCASPAR_ENABLED=ON" .`
 (Dockerfile already bakes in `-DCUDA_ENABLED=OFF -DHIP_ENABLED=ON
