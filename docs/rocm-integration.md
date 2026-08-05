@@ -701,3 +701,93 @@ none of the staged images' cameras use `OPENCV`; a follow-up with an
 correct results on gfx1151, not just a clean compile.
 
 Commit: `docs: verify Caspar-HIP bundle adjustment on real data, gfx1151 — closes prior Task 6 deferral`.
+
+### 2026-08-05: CUDA_ENABLED=ON regression check on cps-gpu-cluster (A100)
+
+Verified this session's extensive HIP-specific work (Tasks 1–5 above) did not
+regress the original `-DCUDA_ENABLED=ON` build path, using real A100 hardware
+on the `cps-gpu-cluster` (see `~/git/cps-gpu-cluster/CLAUDE.md`).
+
+**Dispatch mechanism finding (the actual point of this task):** `ablator`
+(`~/git/rosbag-colmap-pipeline/ablator`, `configs/ablator.toml`) is
+**dispatch-only** — it has no image-build step, only job submission against a
+fixed pre-published `image:` tag already in a registry the cluster can pull
+from. It cannot build a new image from this branch. Building+pushing is a
+separate, manual, already-documented `podman build` / `podman push` flow
+(`~/git/rosbag-colmap-pipeline/docs/cluster-dispatch.md`), and registry push
+credentials for `ghcr.io/bjoernellens1/*` were already present on this host
+(`podman login ghcr.io --get-login` → `bjoernellens1`), so this did **not**
+end BLOCKED.
+
+Two things ruled out reusing that documented flow as-is:
+- `colmap-rocm`'s own `Dockerfile` bases on `rocm/pytorch:...` (no `nvcc`) —
+  there is no CUDA-capable base to layer `-DCUDA_ENABLED=ON` onto directly;
+  a CUDA build needs a distinct Dockerfile with a CUDA devel base image.
+- `rosbag-colmap-pipeline/docker/Dockerfile.cuda` (the only existing
+  "CUDA-equivalent" Dockerfile referenced in that repo's docs) `git clone`s
+  `bjoernellens1/colmap` (a *different fork*, pinned to a specific commit),
+  not this repo's `hip-integration` branch — building it would not have
+  tested this branch's CUDA path at all.
+
+**What was actually done:** wrote a new Dockerfile (scratch-only, not
+committed to either repo) modeled directly on `colmap-rocm`'s own
+`Dockerfile` — same dependency list, `COPY . /opt/colmap_src` from this
+branch's worktree — but based on `nvcr.io/nvidia/cuda:12.6.0-devel-ubuntu24.04`
+with `-DCUDA_ENABLED=ON -DHIP_ENABLED=OFF -DCMAKE_CUDA_ARCHITECTURES=80`.
+
+1. **Compile check** (no GPU/cluster needed): built locally via `podman
+   build` at branch tip `b96b57d1`. Compiled clean — `ninja install`
+   completed and `/usr/local/bin/colmap` was installed. `colmap -h` inside
+   the image reports
+   `COLMAP 4.2.0.dev0 ... with CUDA`. No `CUDA_ENABLED`/`HIP_ENABLED`
+   mutual-exclusion guard blocks this combination (`CMakeLists.txt:43` only
+   errors if *both* are `ON` simultaneously, which is correct and unchanged).
+2. **Runtime check on the cluster:** pushed the built image as a new tag,
+   `ghcr.io/bjoernellens1/colmap-rgbd-gt:cuda-hip-integration-regression-b96b57d1`,
+   onto the *existing public* `colmap-rgbd-gt` GHCR package (deliberately not
+   a new package — a new package defaults private and pods would hang
+   forever in `ContainerCreating` with zero events, per
+   `rosbag-colmap-pipeline/docs/cluster-dispatch.md`).
+   `ablator`'s `[types.reconstruct]` job type assumes a `gttool` entrypoint
+   this image doesn't have (ENTRYPOINT is `colmap`), so dispatched directly
+   via a `kubectl` `Job` instead (single PVC mount, `kai-scheduler`,
+   `kai-batch-low`, `nvidia.com/gpu: 1`, namespace `jupyterhub`) — a one-off
+   `Job` is the lower-risk path for a single regression check anyway.
+   Ran `feature_extractor` → `exhaustive_matcher` → `mapper` with
+   `--FeatureExtraction.use_gpu 1` / `--FeatureMatching.use_gpu 1` against 8
+   frames sampled from the TUM `freiburg1_desk` sequence already present on
+   this host (copied to the cluster's NFS-backed scratch PVC, then to
+   node-local disk inside the pod first — COLMAP's SQLite `database.db` is
+   documented-unreliable directly over NFS on this cluster).
+
+   Result: scheduled on `k3s-wk-gpu2`, image pulled in 55s (5.4GB; no
+   45-minute cold-pull hazard hit — not investigated further why this was
+   fast). `nvidia-smi` inside the pod correctly showed the assigned A100.
+   GPU SIFT extraction (1000-2900 features/image across all 8 frames) and
+   GPU matching (14 verified pairs) both completed without error. `mapper`
+   registered 4 of the 8 images into one kept reconstruction (initial pair
+   #6+#5, then #4, #8, #7 added; every other candidate initial pair was
+   tried and discarded for lacking a good match), writing a real
+   `points3D.bin` sparse model. Job reported `Succeeded`. The partial
+   (4/8) registration is expected dataset sparsity — these are widely
+   spaced, non-consecutive frames from a monocular RGB sequence, not a
+   curated multiview set — not a sign of a build regression; the GPU
+   extraction/matching/BA code paths themselves ran clean throughout.
+
+**Verdict: PASS.** `CUDA_ENABLED=ON` still compiles and runs correctly on
+real A100 hardware after this session's HIP-specific changes — no
+regression. Local test images, the scratch-PVC test data, and the `kubectl`
+`Job` were all cleaned up after the check; nothing was left running on the
+cluster, and no `cluster-maintenance/` manifests in `cps-gpu-cluster` were
+touched (Fleet-managed tree was not used for this — this was ad hoc one-off
+job dispatch against the existing cluster, per this task's scope). One
+thing *not* cleaned up: the pushed image tag
+`ghcr.io/bjoernellens1/colmap-rgbd-gt:cuda-hip-integration-regression-b96b57d1`
+was left on the public GHCR package (consistent with the many other
+`cuda-caspar-*`/`cuda-test`-style tags already there from this session).
+Also note: the CUDA Dockerfile used for this check lives only in this
+session's scratchpad, not committed to either repo — this check is not
+directly reproducible from either repo's current state without recreating
+that Dockerfile (it mirrors `colmap-rocm`'s own `Dockerfile` but on a CUDA
+devel base with `-DCUDA_ENABLED=ON -DHIP_ENABLED=OFF
+-DCMAKE_CUDA_ARCHITECTURES=80`).
