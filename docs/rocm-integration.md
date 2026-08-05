@@ -1518,3 +1518,99 @@ built) remains the right scale to iterate on, not the full 613-image case.
 All debug images were tagged locally (`colmap-rocm:opencv-debug-traceN`)
 and were not pushed anywhere; the source tree itself was left clean (every
 instrumentation edit reverted via `git checkout --` once superseded).
+
+## 2026-08-05 (session 3): preconditioner-conditioning hypothesis directly tested and refuted; still BLOCKED
+
+Direct follow-up testing this session's own leading hypothesis: that
+OpenCV's 6-dim `FocalAndExtra` preconditioner block (mixing `fx≈546` with
+`p2≈-0.0018` in one unscaled Cholesky-style factorization) produces an
+already-wrecked (garbage/NaN) preconditioner before any PCG iteration even
+runs. Same `in_2` fast-repro cycle, same instrument→rebuild→run→revert
+discipline as the prior two rounds; nothing below is in the committed tree.
+
+**The preconditioner is not garbage — it's small but numerically stable.**
+`kernel_OpenCVFocalAndExtra_normalize.cu` implements the block's
+preconditioner application as a 6-variable sequential LDLT-style elimination
+(6 reciprocal "pivots" computed via Schur-complement updates, no `sqrt`
+anywhere in this kernel — unlike `retract`, this one can't hit a
+`sqrt(negative)`). Instrumented all 6 pivot reciprocals and the final
+4-component output for NaN/Inf on `in_2`. Result: pivots
+`1.71e-2, 2.84e-2, 1.16e-6, 1.94e-5, 6.41e-8, 4.30e-8` — small (consistent
+with the huge `precond_diag` magnitudes already logged in the prior entry,
+up to `1.6e7`, since pivot ≈ 1/diag) but **entirely finite, none negative,
+none zero**, and zero `NORMALIZE_NAN` flags fired across the run. The
+coordinator's specific mechanism — a naive unscaled Cholesky-like solve
+producing a day-zero-wrecked preconditioner — does not hold: the actual
+numbers show poor conditioning (roughly a `10^5`-`10^6` spread across the
+six pivots) but not numerical failure at this step.
+
+**OpenCVPose's normalize kernel is structurally and numerically identical
+to Pinhole's on this data.** Both models' `Pose` node is a 6-dim SE3
+tangent using the exact same LDLT-elimination structure (confirmed
+line-for-line: same six `1.0 / r*` pivot sites at identical positions in
+both `.cu` files, differing only in earlier register-naming from
+independent codegen runs, already established in the prior entry). Ran the
+identical pivot instrumentation on both `kernel_OpenCVPose_normalize.cu`
+(against `in_2`) and `kernel_PinholePose_normalize.cu` (against the
+same-poses/points `in_2_pinhole` control): both report the identical
+`1.0e+06` pivot value for the gauge-fixed pose (thread 0) — expected, since
+a fixed node's regularization-only diagonal is model-independent — and
+neither shows any NaN signature. (Only thread 0, the fixed pose, was
+captured this round; the free pose's pivots weren't separately isolated,
+but the RK dump in the prior entry already showed its `precond_diag`
+magnitude is unremarkable, ~1e6-1e8, similar order to Pinhole's own.)
+
+**Retract's transcendental-function surface is identical between models.**
+Grepped both `kernel_OpenCVPose_retract.cu` and `kernel_PinholePose_retract.cu`
+for every `sqrt`/`rsqrt`/`acos`/`asin`/`atan` call site (the classic
+"negative-input-to-sqrt" NaN source for quaternion exponential maps): both
+files call exactly `sqrtf` once and `rsqrtf` once, at the same structural
+position, with no additional epsilon-guarding in either — same math, same
+risk profile, same absence of anything OpenCV-specific.
+
+**Status: still BLOCKED.** The float32-conditioning-produces-garbage
+hypothesis, while a reasonable and worth-testing mechanism given the raw
+`precond_diag` magnitude spread already on record, is now directly refuted
+by instrumented evidence rather than left as a plausible-sounding
+unconfirmed theory. Combined with the prior two rounds (res_jac clean on
+every factor, score clean on in-range threads, every single node-type
+isolated as sole-free-group still fails, preconditioner sizing/formula
+matches Pinhole's exactly), the search has now covered: residual/Jacobian,
+score/cost recomputation, preconditioner construction and application
+(both FocalAndExtra and Pose blocks), and retract's transcendental
+functions. None show a defect on `in_2`, and everything checked either
+produces clean finite output or is structurally/numerically identical to
+the working Pinhole case on the same poses and points.
+
+**What has not yet been instrumented:** the CG direction-update kernels
+proper — `update_p` (search direction), `update_r`/`update_r_first`
+(residual update), `update_Mp` (preconditioner-vector product), and the
+`alpha`/`beta`/`pred_decrease` step-size and trust-region kernels
+(`kernel_OpenCVFocalAndExtra_alpha_numerator_denominator.cu`,
+`alpha_denominator_or_beta_numerator.cu`, `pred_decrease_times_two.cu`) that
+decide the LM step's acceptance. These remain the concrete next targets,
+but given the amount of adjacent surface area already ruled out clean and
+structurally-matching-Pinhole, it may be more efficient for the next
+session to widen the net rather than continue one-kernel-at-a-time: e.g.
+dump the actual PCG solution vector / retracted pose+calib+point values
+immediately after the *first* PCG iteration completes (before the score
+kernel even runs) and check those for NaN directly, which would in one
+shot tell us whether the corruption is upstream (in the CG loop) or
+downstream (in retract's application of an already-bad step) of the parts
+already ruled out.
+
+**Also worth flagging as a possible non-kernel angle, unexplored:** every
+hypothesis tested so far has assumed the bug is in the generated-kernel
+math. An alternative not yet investigated is a data/indexing bug on the
+C++ host side in `bundle_adjustment_caspar.cc` — e.g. `SetVariantFactors`
+or the per-model `idx_shared_` construction for OpenCV specifically writing
+a wrong or stale index into `pose_indices`/`point_indices`/
+`focal_and_extra_indices` for some factors, which downstream kernels would
+silently read as valid-looking but wrong data (not necessarily NaN at any
+single point checked, but converging to a numerically inconsistent overall
+system). This is speculative and not evidenced either way — flagging it as
+an alternative direction if the CG-kernel instrumentation above also comes
+back clean.
+
+No fix shipped this round — the coordinator's proposed mechanism was
+tested directly and did not hold, so no speculative change was made.
